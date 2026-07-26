@@ -40,8 +40,10 @@ Thanks to @Shane for this great windows utility to mirror desktop.
 ### [Fightcade]
 In progress
 
-### [PCSX2]
-In progress
+### [PCSX2](https://github.com/verbst/pcsx2)
+Thanks to PCSX2 team.
+
+- Dualshock input support w/Rumble
 
 ### [RPCS3]
 In progress
