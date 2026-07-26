@@ -1,0 +1,2 @@
+=== 120 MHz (period 8.333 ns) ===
+=== 150 MHz (period 6.667 ns) ===

@@ -1,0 +1,35 @@
+# aclk_sta.qsf — /47 P-side experiment: standalone STA of the NLC decoder at an elevated clock.
+# Same device + virtual-pin setup as sim/gate; the SDC (aclk_sta.sdc, written by run_sta.sh per
+# target frequency) is the only difference vs the 82.75MHz production context.
+
+set_global_assignment -name FAMILY "Cyclone V"
+set_global_assignment -name DEVICE 5CSEBA6U23I7
+set_global_assignment -name TOP_LEVEL_ENTITY nlc_decode_ddr
+set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
+set_global_assignment -name SDC_FILE aclk_sta.sdc
+
+# --- source (the DUT only) ---
+set_global_assignment -name VERILOG_FILE ../../rtl/nlc_decode_ddr.v
+set_global_assignment -name VERILOG_FILE ../../rtl/nlc_plane_core.v
+
+# --- all top-level ports VIRTUAL (module has ~275 I/O > physical pins; STA only) ---
+set_instance_assignment -name VIRTUAL_PIN ON -to clk
+set_instance_assignment -name VIRTUAL_PIN ON -to reset
+set_instance_assignment -name VIRTUAL_PIN ON -to cfg_w
+set_instance_assignment -name VIRTUAL_PIN ON -to cfg_h
+set_instance_assignment -name VIRTUAL_PIN ON -to cfg_near
+set_instance_assignment -name VIRTUAL_PIN ON -to cfg_tile
+set_instance_assignment -name VIRTUAL_PIN ON -to cfg_color
+set_instance_assignment -name VIRTUAL_PIN ON -to compressed_long
+set_instance_assignment -name VIRTUAL_PIN ON -to write_long
+set_instance_assignment -name VIRTUAL_PIN ON -to write_ready
+set_instance_assignment -name VIRTUAL_PIN ON -to uncompressed_long
+set_instance_assignment -name VIRTUAL_PIN ON -to long_valid
+set_instance_assignment -name VIRTUAL_PIN ON -to out_ready
+set_instance_assignment -name VIRTUAL_PIN ON -to uncompressed_bytes
+set_instance_assignment -name VIRTUAL_PIN ON -to writed_bytes
+set_instance_assignment -name VIRTUAL_PIN ON -to readed_bytes
+set_instance_assignment -name VIRTUAL_PIN ON -to paused
+set_instance_assignment -name VIRTUAL_PIN ON -to done
+
+set_global_assignment -name LAST_QUARTUS_VERSION "17.0.2 Lite Edition"

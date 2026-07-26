@@ -1,0 +1,5 @@
+QUARTUS_VERSION = "17.0"
+DATE = "2026/07/05"
+
+# A-clock STA experiment (/47 plan, P-side): can the NLC decoder close timing at 120/150MHz?
+PROJECT_REVISION = "aclk_sta"

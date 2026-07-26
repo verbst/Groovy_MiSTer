@@ -1,6 +1,6 @@
 /**************************************************************
 
-   groovymister_wrapper.h - GroovyMiSTer C wrapper API header file
+   groovymister_wrapper.cpp - GroovyMiSTer C wrapper API
 
    ---------------------------------------------------------
 
@@ -19,14 +19,22 @@ extern "C" {
 GroovyMister* gmw;
 int gmw_inputsBinded;
 
-MODULE_API_GMW int gmw_init(const char* misterHost, uint8_t lz4Frames, uint32_t soundRate, uint8_t soundChan, uint8_t rgbMode, uint16_t mtu)
+// The pre-init setters (caps, NLC knobs, auto-reconnect, log level) must work
+// before gmw_init/gmw_bindInputs have created the singleton — create it on
+// demand so call ordering never matters.
+static GroovyMister* gmw_instance(void)
 {
 	if (gmw == NULL)
 	{
 		gmw = new GroovyMister;
 		gmw_inputsBinded = 0;
 	}
-	return gmw->CmdInit(misterHost, 32100, lz4Frames, soundRate, soundChan, rgbMode, mtu);	
+	return gmw;
+}
+
+MODULE_API_GMW int gmw_init(const char* misterHost, uint8_t lz4Frames, uint32_t soundRate, uint8_t soundChan, uint8_t rgbMode, uint16_t mtu)
+{
+	return gmw_instance()->CmdInit(misterHost, 32100, lz4Frames, soundRate, soundChan, rgbMode, mtu);
 }
 
 MODULE_API_GMW void gmw_close(void)
@@ -42,6 +50,28 @@ MODULE_API_GMW void gmw_close(void)
 	{
 		printf("[MiSTer] gmw_close failed\n");
 	}
+}
+
+// Send CMD_CLOSE only (no teardown / no delete). Safe to call repeatedly and
+// before gmw_close. Lets the socket-owning sender thread tell the MiSTer to
+// return to connection-search on stream stop even when the RIO completion
+// queues are no longer drained.
+MODULE_API_GMW void gmw_send_close(void)
+{
+	if (gmw != NULL)
+	{
+		gmw->CmdSendClose();
+	}
+}
+
+MODULE_API_GMW uint8_t gmw_is_connected(void)
+{
+	return (gmw != NULL) ? gmw->isConnected() : 0;
+}
+
+MODULE_API_GMW uint32_t gmw_reconnect_epoch(void)
+{
+	return (gmw != NULL) ? gmw->reconnectEpoch() : 0;
 }
 
 MODULE_API_GMW void gmw_switchres(double pClock, uint16_t hActive, uint16_t hBegin, uint16_t hEnd, uint16_t hTotal, uint16_t vActive, uint16_t vBegin, uint16_t vEnd, uint16_t vTotal, uint8_t interlace)
@@ -184,16 +214,42 @@ MODULE_API_GMW void gmw_getStatus(gmw_fpgaStatus* status)
 
 MODULE_API_GMW void gmw_bindInputs(const char* misterHost)
 {
-	if (gmw == NULL)
-	{
-		gmw = new GroovyMister();
-		gmw_inputsBinded = 0;
-	}
+	gmw_instance();
 	if (!gmw_inputsBinded)
 	{
 		gmw->BindInputs(misterHost, 32101);
 	}
 	gmw_inputsBinded = 1;
+}
+
+// Re-send only the input subscribe datagram (no socket re-create). Safe to
+// call repeatedly; only meaningful after gmw_bindInputs.
+MODULE_API_GMW void gmw_resubscribe_inputs(void)
+{
+	if (gmw != NULL)
+	{
+		gmw->ResendInputSubscribe();
+	}
+}
+
+MODULE_API_GMW void gmw_set_input_caps(uint8_t caps)
+{
+	gmw_instance()->setInputCaps(caps);
+}
+
+MODULE_API_GMW uint8_t gmw_get_input_caps(void)
+{
+	return (gmw != NULL) ? gmw->getInputCaps() : 0;
+}
+
+// Internally guarded (connected + inputs bound + GMW_CAP_RUMBLE negotiated) —
+// deliberately quiet otherwise: the pad layer may push motor state at any time.
+MODULE_API_GMW void gmw_send_rumble(uint8_t player, uint8_t strong, uint8_t weak)
+{
+	if (gmw != NULL)
+	{
+		gmw->SendRumble(player, strong, weak);
+	}
 }
 
 MODULE_API_GMW void gmw_pollInputs(void)
@@ -224,10 +280,14 @@ MODULE_API_GMW void gmw_getJoyInputs(gmw_fpgaJoyInputs* joyInputs)
 		joyInputs->joy2LYAnalog = gmw->joyInputs.joy2LYAnalog;
 		joyInputs->joy2RXAnalog = gmw->joyInputs.joy2RXAnalog;
 		joyInputs->joy2RYAnalog = gmw->joyInputs.joy2RYAnalog;
+		joyInputs->joy1LTAnalog = gmw->joyInputs.joy1LTAnalog;
+		joyInputs->joy1RTAnalog = gmw->joyInputs.joy1RTAnalog;
+		joyInputs->joy2LTAnalog = gmw->joyInputs.joy2LTAnalog;
+		joyInputs->joy2RTAnalog = gmw->joyInputs.joy2RTAnalog;
 	}
 	else
 	{
-		memset(&joyInputs, 0, sizeof(joyInputs));
+		memset(joyInputs, 0, sizeof(*joyInputs));
 		printf("[MiSTer] gmw_getJoyInputs failed\n");
 	}
 }
@@ -246,7 +306,7 @@ MODULE_API_GMW void gmw_getPS2Inputs(gmw_fpgaPS2Inputs* ps2Inputs)
 	}
 	else
 	{
-		memset(&ps2Inputs, 0, sizeof(ps2Inputs));
+		memset(ps2Inputs, 0, sizeof(*ps2Inputs));
 		printf("[MiSTer] gmw_getPS2Inputs failed\n");
 	}
 }
@@ -266,14 +326,48 @@ MODULE_API_GMW const char* gmw_get_version()
 
 MODULE_API_GMW void gmw_set_log_level(int level)
 {
-	if (gmw != NULL)
-	{
-		gmw->setVerbose(level);
-	}
-	else
-	{
-		printf("[MiSTer] gmw_set_log_level failed\n");
-	}
+	gmw_instance()->setVerbose(level);
+}
+
+// Route LOG() output into the host's logger (process-wide sink); verbose maps
+// onto the instance log level so one call configures both.
+MODULE_API_GMW void gmw_set_log_callback(void (*fn)(const char* msg), int verbose)
+{
+	gm_set_log_sink(fn);
+	gmw_instance()->setVerbose(verbose);
+}
+
+// Codec-corpus capture: dump the next `maxFrames` uncompressed pre-encode
+// frames into <dir>/frame_WxH_fmt_NNNNNN.raw, then auto-stop. Off by default.
+// Pass dir=NULL or "" to disable. Call from the thread that drives gmw_blit to
+// avoid racing DumpFrame's reads of the dump state inside CmdBlit.
+MODULE_API_GMW void gmw_set_frame_dump(const char* dir, uint32_t maxFrames)
+{
+	gmw_instance()->setFrameDump(dir, maxFrames);
+}
+
+// NLC codec tuning passthroughs. Both ride the CMD_INIT byte[1] packing, so these
+// MUST be called BEFORE gmw_init for the FPGA to see them. Setting them at runtime
+// is a no-op until the next CmdInit (an auto-reconnect re-issues CMD_INIT with the
+// current values, so the session stays consistent across reconnects).
+MODULE_API_GMW void gmw_set_near_level(uint8_t k)
+{
+	gmw_instance()->setNearLevel(k);
+}
+
+MODULE_API_GMW void gmw_set_nlc_pack(uint8_t pack)
+{
+	gmw_instance()->setNlcPack(pack);
+}
+
+MODULE_API_GMW void gmw_set_nlc_disp_mode(uint8_t mode)
+{
+	gmw_instance()->setNlcDispMode(mode);
+}
+
+MODULE_API_GMW void gmw_set_auto_reconnect(uint8_t on)
+{
+	gmw_instance()->setAutoReconnect(on);
 }
 
 

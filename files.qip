@@ -5,8 +5,15 @@ set_global_assignment -name VHDL_FILE rtl/vga_overlay.vhd
 set_global_assignment -name QIP_FILE rtl/fifo_vga.qip
 set_global_assignment -name QIP_FILE rtl/fifo_sound.qip
 set_global_assignment -name VERILOG_FILE rtl/lz4.v
+set_global_assignment -name VERILOG_FILE rtl/nlc_plane_core.v
+set_global_assignment -name VERILOG_FILE rtl/nlc_decode_ddr.v
+set_global_assignment -name VERILOG_FILE rtl/ddr_mux2.v
+set_global_assignment -name VERILOG_FILE rtl/nlc_engine.v
 set_global_assignment -name VERILOG_FILE rtl/hps_ext.v
 set_global_assignment -name VERILOG_FILE rtl/JTFRAME/jtframe_resync.v
+set_global_assignment -name VERILOG_FILE rtl/JTFRAME/jtframe_hsize.v
+set_global_assignment -name VERILOG_FILE rtl/JTFRAME/jtframe_linebuf.v
+set_global_assignment -name VERILOG_FILE rtl/JTFRAME/jtframe_rpwp_ram.v
 set_global_assignment -name VERILOG_FILE rtl/vga.v
 set_global_assignment -name VERILOG_FILE rtl/sound.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ddram.sv
