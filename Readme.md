@@ -30,6 +30,28 @@ https://youtu.be/H0175WJFpUs
   3. Save libelf.so.1 on /usr/lib (library requiered)
   4. On MiSTer.ini change binary from MiSTer_groovy to MiSTer_groovy_XDP 
 ## Emulators available
+
+Emulators require updates for NLC & new input support.
+Please use these forks:
+
+### [MiSTerCast](https://github.com/iequalshane/MiSTerCast](https://github.com/verbst/MiSTerCast) 
+Thanks to @Shane for this great windows utility to mirror desktop.
+
+### [Fightcade]
+In progress
+
+### [PCSX2]
+In progress
+
+### [RPCS3]
+In progress
+
+### [Retroarch]
+In progress
+
+
+
+~~
 ### [GroovyMAME](https://github.com/antonioginer/GroovyMAME/releases) <br />
   MAME fork by @Calamity, download mame_mister.ini and rename to mame.ini
  
@@ -106,10 +128,8 @@ https://youtu.be/H0175WJFpUs
 
 ### [Dolphin]() 
   New submenu of graphics options. After emulators starts gamepads from MiSTer can be mapped.
-    
-    
-### [MiSTerCast](https://github.com/iequalshane/MiSTerCast) 
-Thanks to @Shane for this great windows utility to mirror desktop.
+
+~~
 
 ## Thanks
 @Calamity for hard testing core and implement GroovyMAME for it
