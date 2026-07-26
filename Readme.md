@@ -34,7 +34,7 @@ https://youtu.be/H0175WJFpUs
 Emulators require updates for NLC & new input support.
 Please use these forks:
 
-### [MiSTerCast](https://github.com/iequalshane/MiSTerCast](https://github.com/verbst/MiSTerCast) 
+### [MiSTerCast](https://github.com/verbst/MiSTerCast) 
 Thanks to @Shane for this great windows utility to mirror desktop.
 
 ### [Fightcade]
@@ -51,7 +51,7 @@ In progress
 
 
 
-~~
+~~~
 ### [GroovyMAME](https://github.com/antonioginer/GroovyMAME/releases) <br />
   MAME fork by @Calamity, download mame_mister.ini and rename to mame.ini
  
@@ -129,7 +129,7 @@ In progress
 ### [Dolphin]() 
   New submenu of graphics options. After emulators starts gamepads from MiSTer can be mapped.
 
-~~
+~~~
 
 ## Thanks
 @psakhis for all your work, making this all possible
