@@ -1153,6 +1153,15 @@ typedef struct
 	uint16_t jkmap[1024];
 	int      stick_l[2];
 	int      stick_r[2];
+	int      trigger_l;
+	int      trigger_r;
+	int      profile;    // groovy: active map profile (0 = default, no suffix)
+	char     ctype;      // groovy: controller type ('A'rcade, 'D'ualshock, 'P'ad)
+	char     nick[17];   // groovy: user nickname (empty = auto-generated)
+	char     pnames[10][17]; // groovy: per-profile display names (empty = auto)
+	uint8_t  prumble[10]; // groovy: per-profile rumble enable (default 1)
+	uint8_t  pinvy[10];   // groovy: per-profile invert stick-Y (default 0)
+	uint8_t  has_gcfg;   // groovy: per-device sidecar loaded
 
 	uint8_t  has_kbdmap;
 	uint8_t  kbdmap[256];
@@ -1181,6 +1190,7 @@ typedef struct
 	int      rumble_en;
 	uint16_t last_rumble;
 	ff_effect rumble_effect;
+	uint32_t rumble_replay;   // groovy: GetTimer deadline to re-arm the FF replay window
 
 	int8_t   wh_steer;
 	int8_t   wh_accel;
@@ -1209,6 +1219,10 @@ typedef struct
 static devInput input[NUMDEV] = {};
 static devInput player_pad[NUMPLAYERS] = {};
 static devInput player_pdsp[NUMPLAYERS] = {};
+
+// set by reset_players(); suspends the MiSTer.ini player_N_controller forcing
+// for the life of this process (i.e. until another core is loaded).
+static int ignore_cfg_players = 0;
 
 #define JOYCON_COMBO(dev)    (input[(dev)].misc_flags & (1 << 31))
 #define JOYCON_LEFT(dev)     (input[(dev)].misc_flags & (1 << 30))
@@ -1261,6 +1275,12 @@ static int check_devs()
 	while (i<length)
 	{
 		struct inotify_event *event = (struct inotify_event *) &buffer[i];
+		if (!event->len)
+		{
+			// zero-length event (e.g. IN_Q_OVERFLOW): queue state is unknown and a
+			// device removal may have been lost -> force a rescan (always safe)
+			result = 1;
+		}
 		if (event->len)
 		{
 			if (event->mask & IN_CREATE)
@@ -1486,9 +1506,190 @@ static char *get_map_name(int dev, int def)
 	char *id = get_unique_mapping(dev);
 
 	if (def || is_menu()) sprintfz(name, "input_%s%s_v3.map", id, input[dev].mod ? "_m" : "");
+	else if (is_groovy() && input[dev].profile > 0) sprintfz(name, "%s_input_%s%s_p%d_v3.map", user_io_get_core_name(), id, input[dev].mod ? "_m" : "", input[dev].profile);
 	else sprintfz(name, "%s_input_%s%s_v3.map", user_io_get_core_name(), id, input[dev].mod ? "_m" : "");
 	return name;
 }
+
+// ---- groovy per-device config (sidecar) ---------------------------------------------
+// /media/fat/config/inputs/<id>_groovy.cfg - plain text: profile=<0..9> type=<A|D|P> nick=<name>
+// Keyed like the map files (get_unique_mapping) so it follows CONTROLLER_UNIQUE_MAPPING.
+static char *get_gcfg_name(int dev)
+{
+	static char name[1024];
+	sprintfz(name, "inputs/%s_groovy.cfg", get_unique_mapping(dev));
+	return name;
+}
+
+static void groovy_gcfg_load(int dev)
+{
+	input[dev].has_gcfg = 1;
+	input[dev].profile = 0;
+	input[dev].nick[0] = 0;
+	// type default by vendor: GP2040-CE -> arcade, Sony -> dualshock, Microsoft -> xbox
+	input[dev].ctype = (input[dev].vid == 0x16d0) ? 'A' : (input[dev].vid == 0x054c) ? 'D' : (input[dev].vid == 0x045e) ? 'X' : 'P';
+
+	memset(input[dev].pnames, 0, sizeof(input[dev].pnames));
+	for (int n = 0; n < 10; n++) { input[dev].prumble[n] = 1; input[dev].pinvy[n] = 0; }
+	char buf[1024] = {};
+	if (FileLoadConfig(get_gcfg_name(dev), buf, sizeof(buf) - 1) <= 0) return;
+	char *p = strstr(buf, "profile=");
+	if (p) input[dev].profile = atoi(p + 8);
+	p = strstr(buf, "type=");
+	if (p && (p[5] == 'A' || p[5] == 'D' || p[5] == 'X' || p[5] == 'P')) input[dev].ctype = p[5];
+	p = strstr(buf, "nick=");
+	if (p)
+	{
+		snprintf(input[dev].nick, sizeof(input[dev].nick), "%s", p + 5);
+		char *e = strpbrk(input[dev].nick, "\r\n");
+		if (e) *e = 0;
+	}
+	for (int n = 0; n < 10; n++)
+	{
+		char key[12];
+		snprintf(key, sizeof(key), "pname%d=", n);
+		p = strstr(buf, key);
+		if (p)
+		{
+			snprintf(input[dev].pnames[n], sizeof(input[dev].pnames[n]), "%s", p + strlen(key));
+			char *e = strpbrk(input[dev].pnames[n], "\r\n");
+			if (e) *e = 0;
+		}
+		snprintf(key, sizeof(key), "rumble%d=", n);
+		p = strstr(buf, key);
+		if (p) input[dev].prumble[n] = atoi(p + strlen(key)) ? 1 : 0;
+		snprintf(key, sizeof(key), "invy%d=", n);
+		p = strstr(buf, key);
+		if (p) input[dev].pinvy[n] = atoi(p + strlen(key)) ? 1 : 0;
+	}
+	if (input[dev].profile < 0 || input[dev].profile > 9) input[dev].profile = 0;
+}
+
+static void groovy_gcfg_save(int dev)
+{
+	char buf[1024];
+	int len = snprintf(buf, sizeof(buf), "profile=%d\ntype=%c\nnick=%s\n", input[dev].profile, input[dev].ctype, input[dev].nick);
+	for (int n = 0; n < 10; n++)
+	{
+		if (len > (int)sizeof(buf) - 48) break;
+		if (input[dev].pnames[n][0]) len += snprintf(buf + len, sizeof(buf) - len, "pname%d=%s\n", n, input[dev].pnames[n]);
+		if (!input[dev].prumble[n])   len += snprintf(buf + len, sizeof(buf) - len, "rumble%d=0\n", n);
+		if (input[dev].pinvy[n])      len += snprintf(buf + len, sizeof(buf) - len, "invy%d=1\n", n);
+	}
+	FileSaveConfig(get_gcfg_name(dev), buf, len);
+}
+
+// public accessors for the Controllers OSD page and /dev/MiSTer_cmd
+void groovy_set_profile(int dev, int profile)
+{
+	if (!input[dev].has_gcfg) groovy_gcfg_load(dev);
+	input[dev].profile = (profile < 0) ? 0 : (profile > 9) ? 9 : profile;
+	groovy_gcfg_save(dev);
+	// same invalidation finish_map_setting uses: every device lazily reloads its maps
+	for (int i = 0; i < NUMDEV; i++)
+	{
+		input[i].has_map = 0;
+		input[i].has_mmap = 0;
+	}
+	printf("Groovy: dev %d (%s) -> profile %d\n", dev, input[dev].idstr, input[dev].profile);
+}
+
+void groovy_set_ctype(int dev, char t)
+{
+	if (!input[dev].has_gcfg) groovy_gcfg_load(dev);
+	if (t == 'A' || t == 'D' || t == 'X' || t == 'P') input[dev].ctype = t;
+	groovy_gcfg_save(dev);
+}
+
+void groovy_set_nick(int dev, const char *nick)
+{
+	if (!input[dev].has_gcfg) groovy_gcfg_load(dev);
+	snprintf(input[dev].nick, sizeof(input[dev].nick), "%s", nick);
+	groovy_gcfg_save(dev);
+}
+
+int groovy_get_profile(int dev) { if (!input[dev].has_gcfg) groovy_gcfg_load(dev); return input[dev].profile; }
+char groovy_get_ctype(int dev)  { if (!input[dev].has_gcfg) groovy_gcfg_load(dev); return input[dev].ctype; }
+
+// per-profile display name (falls back to "default" / "profile N")
+char *groovy_get_pname(int dev, int prof)
+{
+	static char pn[24];
+	if (!input[dev].has_gcfg) groovy_gcfg_load(dev);
+	if (prof < 0 || prof > 9) prof = 0;
+	if (input[dev].pnames[prof][0]) snprintf(pn, sizeof(pn), "%s", input[dev].pnames[prof]);
+	else if (!prof) snprintf(pn, sizeof(pn), "default");
+	else snprintf(pn, sizeof(pn), "profile %d", prof);
+	return pn;
+}
+
+void groovy_set_pname(int dev, int prof, const char *name)
+{
+	if (!input[dev].has_gcfg) groovy_gcfg_load(dev);
+	if (prof < 0 || prof > 9) return;
+	snprintf(input[dev].pnames[prof], sizeof(input[dev].pnames[prof]), "%s", name);
+	groovy_gcfg_save(dev);
+}
+
+// menu-side view of the device's CURRENT-profile map: live copy when loaded, else
+// straight from the map file (does not touch device state); returns 1 if found
+int groovy_read_map(int dev, uint32_t *out)
+{
+	if (input[dev].has_map)
+	{
+		memcpy(out, input[dev].map, sizeof(input[dev].map));
+		return 1;
+	}
+	memset(out, 0, sizeof(input[dev].map));
+	return load_map(get_map_name(dev, 0), out, sizeof(input[dev].map)) ? 1 : 0;
+}
+
+int groovy_get_prumble(int dev, int prof) { if (!input[dev].has_gcfg) groovy_gcfg_load(dev); if (prof < 0 || prof > 9) prof = 0; return input[dev].prumble[prof]; }
+void groovy_set_prumble(int dev, int prof, int v) { if (!input[dev].has_gcfg) groovy_gcfg_load(dev); if (prof < 0 || prof > 9) return; input[dev].prumble[prof] = v ? 1 : 0; groovy_gcfg_save(dev); }
+int groovy_get_pinvy(int dev, int prof) { if (!input[dev].has_gcfg) groovy_gcfg_load(dev); if (prof < 0 || prof > 9) prof = 0; return input[dev].pinvy[prof]; }
+void groovy_set_pinvy(int dev, int prof, int v) { if (!input[dev].has_gcfg) groovy_gcfg_load(dev); if (prof < 0 || prof > 9) return; input[dev].pinvy[prof] = v ? 1 : 0; groovy_gcfg_save(dev); }
+
+// single-button remap capture (Controllers page): the next physical pad button
+// press on the target device is written to map[pos] (primary/low-16), saved to the
+// active profile's map file, then all maps are invalidated so it takes effect live.
+static int groovy_cap_dev = -1;
+static int groovy_cap_pos = -1;
+static int groovy_cap_done = 0;
+void groovy_capture_begin(int dev, int pos) { groovy_cap_dev = dev; groovy_cap_pos = pos; groovy_cap_done = 0; }
+int  groovy_capture_done(void) { return groovy_cap_done; }
+void groovy_capture_cancel(void) { groovy_cap_dev = -1; groovy_cap_pos = -1; groovy_cap_done = 0; }
+
+// display nickname: stored nick, else "<TYPE>#<player>"
+char *groovy_get_nick(int dev)
+{
+	static char nick[32];
+	if (!input[dev].has_gcfg) groovy_gcfg_load(dev);
+	if (input[dev].nick[0])
+	{
+		snprintf(nick, sizeof(nick), "%s", input[dev].nick);
+		return nick;
+	}
+	const char *tname = (input[dev].ctype == 'A') ? "ARCADE" : (input[dev].ctype == 'D') ? "DUALSHOCK" : (input[dev].ctype == 'X') ? "XBOX" : "PAD";
+	if (input[dev].num) snprintf(nick, sizeof(nick), "%s#%d", tname, input[dev].num);
+	else snprintf(nick, sizeof(nick), "%s", tname);
+	return nick;
+}
+
+// first opened device node assigned to a 1-based player (vid filters virtual nodes)
+int groovy_player_dev(int player)
+{
+	for (int i = 0; i < NUMDEV; i++)
+	{
+		if (pool[i].fd >= 0 && input[i].num == player && input[i].vid) return i;
+	}
+	return -1;
+}
+
+char *groovy_dev_name(int dev)
+{
+	return input[dev].name;
+}
+
 
 static char *get_jkmap_name(int dev)
 {
@@ -1561,6 +1762,12 @@ int input_has_lightgun()
 		if (input[i].quirk == QUIRK_LIGHTGUN_CRT) return 1;
 	}
 	return 0;
+}
+
+// groovy: device slot currently being mapped in the define flow (-1 until first press)
+int get_map_dev()
+{
+	return mapping_dev;
 }
 
 uint16_t get_map_vid()
@@ -2189,6 +2396,9 @@ static void joy_analog(int dev, int axis, int offset, int stick = 0)
 			stick_swap(num, stick, &num, &stick);
 		}
 
+		// groovy: per-profile invert stick-Y
+		if (is_groovy() && input[dev].pinvy[(input[dev].profile >= 0 && input[dev].profile <= 9) ? input[dev].profile : 0]) y = (y <= -127) ? 127 : -y;
+
 		if (stick)
 		{
 			user_io_r_analog_joystick(num, (char)x, (char)y);
@@ -2334,6 +2544,8 @@ static void update_num_hw(int dev, int num)
 
 void reset_players()
 {
+	ignore_cfg_players = 1;
+
 	for (int i = 0; i < NUMDEV; i++)
 	{
 		input[i].num = 0;
@@ -2526,6 +2738,24 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 		}
 	}
 
+	// groovy single-button remap: consume the next pad button press (>=256) for
+	// the device being remapped; returns early so it doesn't also navigate the OSD
+	if (groovy_cap_dev >= 0 && ev->type == EV_KEY && ev->value == 1 && ev->code >= 256)
+	{
+		if (dev == groovy_cap_dev && groovy_cap_pos >= 0 && groovy_cap_pos < NUMBUTTONS)
+		{
+			uint32_t cm[NUMBUTTONS];
+			if (!groovy_read_map(dev, cm)) memset(cm, 0, sizeof(cm));
+			cm[groovy_cap_pos] = (cm[groovy_cap_pos] & 0xFFFF0000) | (ev->code & 0xFFFF);
+			save_map(get_map_name(dev, 0), cm, sizeof(cm));
+			for (int i = 0; i < NUMDEV; i++) { input[i].has_map = 0; input[i].has_mmap = 0; }
+			groovy_cap_done = 1;
+			groovy_cap_dev = -1;
+			groovy_cap_pos = -1;
+		}
+		return;
+	}
+
 	if (ev->type == EV_KEY && ev->code < 256 && !(mapping && mapping_type == 2))
 	{
 		if (!input[dev].has_kbdmap)
@@ -2549,6 +2779,9 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 
 	if (!input[dev].has_mmap)
 	{
+		// analog trigger axes (groovy UDP only); resolved below. 0 would alias ABS_X.
+		input[dev].trigger_l = -1;
+		input[dev].trigger_r = -1;
 		if (input[dev].quirk == QUIRK_TOUCHGUN)
 		{
 			memset(input[dev].mmap, 0, sizeof(input[dev].mmap));
@@ -2605,10 +2838,40 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 					input[dev].stick_l[1] = SYS_AXIS2_Y;
 					if ((input[dev].mmap[SYS_AXIS1_Y] >> 16) == 2) input[dev].stick_r[1] = SYS_AXIS1_Y;
 				}
+				if (is_groovy())
+				{
+					// resolve DS/X360-style analog triggers for the groovy UDP path (the FPGA
+					// has no trigger transport): ABS_Z/ABS_RZ, unidirectional (min==0), and
+					// not claimed by a stick above (GP2040 PS3 mode uses Z/RZ as right stick)
+					unsigned char tabs[(ABS_MAX + 7) / 8] = {};
+					if (ioctl(pool[sub_dev].fd, EVIOCGBIT(EV_ABS, sizeof(tabs)), tabs) >= 0)
+					{
+						const uint16_t tcand[2] = { ABS_Z, ABS_RZ };
+						for (int t = 0; t < 2; t++)
+						{
+							if (!(tabs[tcand[t] / 8] & (1 << (tcand[t] % 8)))) continue;
+							if ((input[dev].stick_l[0] && tcand[t] == (uint16_t)input[dev].mmap[input[dev].stick_l[0]])
+							 || (input[dev].stick_l[1] && tcand[t] == (uint16_t)input[dev].mmap[input[dev].stick_l[1]])
+							 || (input[dev].stick_r[0] && tcand[t] == (uint16_t)input[dev].mmap[input[dev].stick_r[0]])
+							 || (input[dev].stick_r[1] && tcand[t] == (uint16_t)input[dev].mmap[input[dev].stick_r[1]])
+							 || tcand[t] == (uint16_t)input[dev].mmap[SYS_AXIS_MX]
+							 || tcand[t] == (uint16_t)input[dev].mmap[SYS_AXIS_MY]) continue;
+							struct input_absinfo tai = {};
+							if (ioctl(pool[sub_dev].fd, EVIOCGABS(tcand[t]), &tai) < 0) continue;
+							if (tai.minimum != 0 || tai.maximum <= tai.minimum) continue;
+							if (tcand[t] == ABS_Z) input[dev].trigger_l = ABS_Z;
+							else input[dev].trigger_r = ABS_RZ;
+							printf("Groovy trigger: %s axis %d as %c-trigger (0..%d)\n", input[dev].devname, tcand[t], (tcand[t] == ABS_Z) ? 'L' : 'R', tai.maximum);
+						}
+					}
+				}
 			}
 		}
 		input[dev].has_mmap++;
 	}
+
+	// groovy: the sidecar (profile/type/nick) must be loaded before get_map_name
+	if (is_groovy() && !input[dev].has_gcfg) groovy_gcfg_load(dev);
 
 	if (!input[dev].has_map)
 	{
@@ -2626,6 +2889,16 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 				{
 					// not defined try to guess the mapping
 					map_joystick(input[dev].map, input[dev].mmap);
+					if (is_groovy())
+					{
+						// jn name-derive only covers the 8 SNES-style buttons; default the
+						// PS-specific slots (J1: ...,L2,R2,L3,R3 at map[12..15]) to the
+						// standard Linux gamepad codes so full pads need no manual define
+						if (!input[dev].map[12]) input[dev].map[12] = 0x138; // BTN_TL2
+						if (!input[dev].map[13]) input[dev].map[13] = 0x139; // BTN_TR2
+						if (!input[dev].map[14]) input[dev].map[14] = 0x13d; // BTN_THUMBL
+						if (!input[dev].map[15]) input[dev].map[15] = 0x13e; // BTN_THUMBR
+					}
 				}
 				else
 				{
@@ -2659,6 +2932,7 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 
 		if (assign_btn)
 		{
+			if (!ignore_cfg_players)
 			for (uint8_t i = 0; i < (sizeof(cfg.player_controller) / sizeof(cfg.player_controller[0])); i++)
 			{
 				for (int n = 0; n < 8; n++)
@@ -3534,6 +3808,20 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 					}
 					else
 					{
+						// DS/X360 analog trigger -> groovy 0..255 (axes resolved at mmap load)
+						if ((input[dev].trigger_l >= 0 && ev->code == input[dev].trigger_l)
+						 || (input[dev].trigger_r >= 0 && ev->code == input[dev].trigger_r))
+						{
+							if (absinfo->maximum > absinfo->minimum)
+							{
+								int tval = ev->value;
+								if (tval < absinfo->minimum) tval = absinfo->minimum;
+								else if (tval > absinfo->maximum) tval = absinfo->maximum;
+								tval = ((tval - absinfo->minimum) * 255) / (absinfo->maximum - absinfo->minimum);
+								user_io_analog_trigger(input[dev].num - 1, ev->code == input[dev].trigger_r, (unsigned char)tval);
+							}
+							break;
+						}
 						int offset = (value < -1 || value > 1) ? value : 0;
 						if (input[dev].stick_l[0] && ev->code == (uint16_t)input[dev].mmap[input[dev].stick_l[0]])
 						{
@@ -4377,6 +4665,11 @@ static int rumble_input_device(int devnum, uint16_t strong_mag, uint16_t weak_ma
 		//If it is filled with an already uploaded effect, the effect is modified in place
 		struct ff_effect *fef;
 		fef = &input[devnum].rumble_effect;
+		// (re)issue PLAY only on stopped->playing, or every ~4s to re-arm the 5s replay
+		// window; magnitude changes go in live via EVIOCSFF below. Re-playing on every
+		// update (the old behaviour) restarted the effect ~60x/s so the motor never span
+		// up -> weak rumble on streamed clients.
+		bool need_play = (fef->id == -1) || CheckTimer(input[devnum].rumble_replay);
 		fef->type = FF_RUMBLE;
 
 		fef->direction = input[devnum].quirk == QUIRK_WHEEL ? 0x4000 : 0x0000;
@@ -4392,13 +4685,18 @@ static int rumble_input_device(int devnum, uint16_t strong_mag, uint16_t weak_ma
 			return 0;
 		}
 
-		//Play effect
-		struct input_event play_ev;
-		play_ev.type = EV_FF;
-		play_ev.code = input[devnum].rumble_effect.id;
-		play_ev.value = 1;
-		ioret = write(fd, (const void *)&play_ev, sizeof(play_ev));
-		return ioret != -1;
+		if (need_play)
+		{
+			//Play effect (re-arms the replay window)
+			struct input_event play_ev;
+			play_ev.type = EV_FF;
+			play_ev.code = input[devnum].rumble_effect.id;
+			play_ev.value = 1;
+			ioret = write(fd, (const void *)&play_ev, sizeof(play_ev));
+			input[devnum].rumble_replay = GetTimer(4000);   // re-play well inside the 5s window
+			return ioret != -1;
+		}
+		return 1;   // magnitude updated live, effect still playing
 	}
 	return 0;
 }
@@ -4412,9 +4710,28 @@ static void set_rumble(int dev, uint16_t rumble_val)
 		strong_m = (rumble_val & 0xFF00) + (rumble_val >> 8);
 		weak_m = (rumble_val << 8) + (rumble_val & 0x00FF);
 
-		rumble_input_device(dev, strong_m, weak_m, 0x7FFF);
+		rumble_input_device(dev, strong_m, weak_m, 5000);   // 5s FF self-expiry = dead-man's-switch
 		input[dev].last_rumble = rumble_val;
 	}
+}
+
+// fork: client-requested rumble from the groovy UDP inputs socket -> player's pad.
+// player is 1-based (matches devInput.num); silently no-ops when the player has no
+// rumble-capable device (or MiSTer.ini rumble=0, which leaves has_rumble unset).
+void input_rumble_player(int player, uint16_t rumble_val)
+{
+	int dev = get_rumble_device(player);
+	if (dev < 0) return;
+	// per-profile rumble toggle (Controllers page); default on
+	if (rumble_val && !groovy_get_prumble(dev, groovy_get_profile(dev))) return;
+	set_rumble(dev, rumble_val);
+}
+
+// fork: stop a device's motors now (effects run up to 32s, so switching the
+// Controllers-page Rumble toggle Off must silence a buzz already in progress).
+void groovy_stop_rumble_dev(int dev)
+{
+	if (dev >= 0 && dev < NUMDEV && input[dev].has_rumble) set_rumble(dev, 0);
 }
 
 static void set_wheel_range(int dev, int range)
@@ -4710,9 +5027,17 @@ int input_test(int getchar)
 							{
 								printf("Cannot switch %s to ImPS/2 protocol(1)\n", input[n].devname);
 							}
-							else if (read(pool[n].fd, buffer, sizeof buffer) != 1 || buffer[0] != 0xFA)
+							else
 							{
-								printf("Failed to switch %s to ImPS/2 protocol(2)\n", input[n].devname);
+								// bounded ACK wait: a mouse node caught mid-USB-teardown never delivers
+								// the 0xFA ACK, and an unguarded blocking read() here wedges the whole
+								// firmware (USB hotplug hang during an active core session)
+								struct pollfd ack = { pool[n].fd, POLLIN, 0 };
+								if (poll(&ack, 1, 100) != 1 || !(ack.revents & POLLIN)
+									|| read(pool[n].fd, buffer, sizeof buffer) != 1 || buffer[0] != 0xFA)
+								{
+									printf("Failed to switch %s to ImPS/2 protocol(2)\n", input[n].devname);
+								}
 							}
 						}
 
@@ -4997,7 +5322,10 @@ int input_test(int getchar)
 					if (input[i].bind >= 0) dev = input[i].bind;
 					if (!input[dev].num) continue;
 
-					set_rumble(i, spi_uio_cmd(UIO_GET_RUMBLE | ((input[dev].num - 1) << 8)));
+					// groovy drives rumble over UDP (input_rumble_player); its core doesn't feed
+					// joystick_rumble, so UIO_GET_RUMBLE reads 0 and this would stop it every loop
+					if (!is_groovy())
+						set_rumble(i, spi_uio_cmd(UIO_GET_RUMBLE | ((input[dev].num - 1) << 8)));
 				}
 			}
 
@@ -5026,6 +5354,21 @@ int input_test(int getchar)
 			{
 				int i = pos;
 
+				// a dead fd (unplugged device) reports POLLHUP/POLLERR forever; only POLLIN
+				// is consumed below, so without this check the while(1) loop spins unboundedly
+				// (starving the whole firmware) until an unrelated inotify event rescues it.
+				// Recover exactly like the inotify path above: close all, full rescan.
+				if ((pool[i].fd >= 0) && (pool[i].revents & (POLLERR | POLLHUP | POLLNVAL)) && !(pool[i].revents & POLLIN))
+				{
+					printf("Device %s dead (revents 0x%x). Close all devices.\n", input[i].devname, pool[i].revents);
+					for (int j = 0; j < NUMDEV; j++) if (pool[j].fd >= 0)
+					{
+						ioctl(pool[j].fd, EVIOCGRAB, 0);
+						close(pool[j].fd);
+					}
+					state = 1;
+					return 0;
+				}
 
 				if ((pool[i].fd >= 0) && (pool[i].revents & POLLIN))
 				{
@@ -5617,6 +5960,34 @@ int input_test(int getchar)
 						if (!strcmp(cmd + 7, "mute")) set_volume(0x81);
 						else if (!strcmp(cmd + 7, "unmute")) set_volume(0x80);
 						else if (cmd[7] >= '0' && cmd[7] <= '7') set_volume(0x40 - 0x30 + cmd[7]);
+					}
+					else if (!strncmp(cmd, "groovy_reset_players", 20))
+					{
+						printf("Groovy: reset player assignment (cmd pipe)\n");
+						reset_players();
+					}
+					else if (!strncmp(cmd, "groovy_profile ", 15))
+					{
+						// groovy_profile <p1..p6 | id-substring e.g. 16d0_1358> <0..9>
+						char *arg = cmd + 15;
+						char *sp = strchr(arg, ' ');
+						if (sp)
+						{
+							*sp = 0;
+							int prof = atoi(sp + 1);
+							int byplayer = (arg[0] == 'p' && arg[1] >= '1' && arg[1] <= '6' && !arg[2]) ? arg[1] - '0' : 0;
+							int hits = 0;
+							for (int i = 0; i < NUMDEV; i++)
+							{
+								if (pool[i].fd < 0 || !input[i].vid) continue;
+								if (byplayer ? (input[i].num == byplayer) : (strstr(input[i].idstr, arg) != NULL))
+								{
+									groovy_set_profile(i, prof);
+									hits++;
+								}
+							}
+							printf("Groovy: profile %d applied to %d device node(s) for '%s'\n", prof, hits, arg);
+						}
 					}
 				}
 			}

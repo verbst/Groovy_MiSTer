@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <math.h>
 #include <cstring>
 
@@ -18,14 +19,53 @@
  #include <unistd.h>
 #endif
 
-#include "lz4/lz4.h"
-#include "lz4/lz4hc.h"
+// Hosts that already link LZ4 (PCSX2, RPCS3) define GM_SYSTEM_LZ4 to use the
+// system headers and skip building api/lz4/ — avoids duplicate-symbol link
+// errors. Only LZ4_compress_default/LZ4_compress_HC are used; API-stable.
+#ifdef GM_SYSTEM_LZ4
+ #include <lz4.h>
+ #include <lz4hc.h>
+#else
+ #include "lz4/lz4.h"
+ #include "lz4/lz4hc.h"
+#endif
+#include "nlc_codec.h"
+
+// CmdInit lz4Frames value selecting the NLC block-adaptive near-lossless codec (tiled, lossless base).
+#define GM_CODEC_NLC_TILED 7
 
 #define USE_RIO 1
 
+// Optional log sink (gm_set_log_sink): replaces stdout as LOG()'s destination
+// so GUI hosts can capture the handshake/failure trace. Verbosity is still the
+// per-instance setVerbose() gate applied by the LOG macro.
+static gm_log_sink_fn g_gmLogSink = 0;
+
+void gm_set_log_sink(gm_log_sink_fn fn)
+{
+	g_gmLogSink = fn;
+}
+
+static void gm_log_emit(const char* fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	if (g_gmLogSink)
+	{
+		char buf[1024];
+		vsnprintf(buf, sizeof(buf), fmt, ap);
+		g_gmLogSink(buf);
+	}
+	else
+	{
+		vprintf(fmt, ap);
+	}
+	va_end(ap);
+}
+
 #define LOG(sev,fmt, ...) do {\
 					if (sev <= m_verbose) {\
-					printf(fmt, __VA_ARGS__);\
+					gm_log_emit(fmt, ##__VA_ARGS__);\
 								}\
 							} while (0)
 
@@ -90,6 +130,10 @@ GroovyMister::GroovyMister()
 	joyInputs.joy2LYAnalog = 0;
 	joyInputs.joy2RXAnalog = 0;
 	joyInputs.joy2RYAnalog = 0;
+	joyInputs.joy1LTAnalog = 0;
+	joyInputs.joy1RTAnalog = 0;
+	joyInputs.joy2LTAnalog = 0;
+	joyInputs.joy2RTAnalog = 0;
 
 	ps2Inputs.ps2Frame = 0;
 	ps2Inputs.ps2Order = 0;
@@ -100,6 +144,12 @@ GroovyMister::GroovyMister()
 	ps2Inputs.ps2MouseZ = 0;
 
 	m_RGBSize = 0;
+	m_nlcWidth = 0;
+	m_nlcDispMode = 2;   // /47 default: mode 2 (autonomous engine) — the rock-solid display path
+	m_nlcPack = 1;       // TILED default; setNlcPack(2) selects RICE (R0-gated: rice+near1 clears the /59 ingest ceiling)
+	m_nearLevel = 0;     // lossless default; near 1 recommended for heavy 3D content
+	m_inputCaps = 0;     // legacy v1 inputs; setInputCaps(GM_CAP_INPUTS_V2 | ...) to opt in
+	m_preEncodedSize = 0;
 	m_interlace = 0;
 	m_vTotal = 0;
 	m_frame = 0;
@@ -109,9 +159,62 @@ GroovyMister::GroovyMister()
 	m_mtu = 0;
 	m_doCongestionControl = 0;
 	m_network_ping = 0;
+	m_dumpFrames = 0;
+	m_dumpCount = 0;
+	m_dumpMax = 0;
+	m_dumpDir[0] = '\0';
+	{
+		const char* env = getenv("GM_FRAME_DUMP");
+		if (env && env[0]) {
+			const char* envMax = getenv("GM_FRAME_DUMP_MAX");
+			setFrameDump(env, envMax ? (uint32_t)atoi(envMax) : 120);
+		}
+	}
 	m_delta_enabled[0] = 0;
 	m_delta_enabled[1] = 0;
 	m_isConnected = 0;
+	m_core_version = 0;
+	m_negotiatedCaps = 0;
+	m_videoTorndown = 1;   // nothing to tear down until CmdInit builds the video side
+	m_autoReconnect = 0;
+
+	memset(m_initHost, 0, sizeof(m_initHost));
+	m_initPort = 0;
+	m_initLz4Frames = 0;
+	m_initSoundRate = 0;
+	m_initSoundChan = 0;
+	m_initRgbMode = 0;
+	m_initMtu = 0;
+	m_switchresValid = 0;
+	m_initPClock = 0;
+	m_initHActive = 0;
+	m_initHBegin = 0;
+	m_initHEnd = 0;
+	m_initHTotal = 0;
+	m_initVActive = 0;
+	m_initVBegin = 0;
+	m_initVEnd = 0;
+	m_initVTotal = 0;
+	m_initInterlace = 0;
+	m_lastFrameEchoSeen = 0;
+	m_noAckBlitCount = 0;
+	m_lastReconnectAttemptMs = 0;
+	m_reconnectEpoch = 0;
+
+	m_rioSendPosted = 0;
+	m_rioSendFailed = 0;
+	m_rioSendDrained = 0;
+	m_rioRecvRepostFailed = 0;
+	m_rioAckTimeout = 0;
+	m_rioLastSummaryMs = 0;
+
+#ifdef _WIN32
+	m_sockFD = INVALID_SOCKET;
+	m_sockInputsFD = INVALID_SOCKET;
+#else
+	m_sockFD = -1;
+	m_sockInputsFD = -1;
+#endif
 
 	memset(&m_tickStart, 0, sizeof(m_tickStart));
 	memset(&m_tickEnd, 0, sizeof(m_tickEnd));
@@ -156,6 +259,37 @@ char* GroovyMister::getPBufferBlit(uint8_t field)
 	return m_pBufferBlit[field];
 }
 
+char* GroovyMister::getPBufferPreEncoded(void)
+{
+	return m_pBufferLZ4[0];
+}
+
+void GroovyMister::setPreEncodedSize(uint32_t cSize)
+{
+	m_preEncodedSize = cSize;
+}
+
+void GroovyMister::buildNlcParams(void* pnp)
+{
+	nlc_params* np = (nlc_params*)pnp;
+	memset(np, 0, sizeof(*np));
+	int bpp = (m_rgbMode == 1) ? 4 : (m_rgbMode == 2) ? 2 : 3;
+	np->width  = m_nlcWidth;
+	np->height = (m_nlcWidth > 0) ? (int)(m_RGBSize / ((uint32_t)m_nlcWidth * bpp)) : 0;
+	np->rgb    = (m_rgbMode == 1) ? NLC_RGBA : (m_rgbMode == 2) ? NLC_RGB565 : NLC_RGB888;
+	np->color  = NLC_COLOR_YCOCG; np->near_lvl = m_nearLevel;
+	np->pack   = (m_nlcPack == 2) ? NLC_PACK_RICE : NLC_PACK_TILED;
+	np->tile = 16; np->width_bits = 4; np->rice_k = -1;
+}
+
+uint32_t GroovyMister::EncodeNLC(const char* rgbFrame, char* out)
+{
+	nlc_params np;
+	buildNlcParams(&np);
+	int r = nlc_encode((const uint8_t*)rgbFrame, (uint8_t*)out, BUFFER_SIZE, &np);
+	return (r > 0) ? (uint32_t)r : 0;
+}
+
 char* GroovyMister::getPBufferBlitDelta(void)
 {
 	return m_pBufferBlitDelta;
@@ -173,6 +307,39 @@ void GroovyMister::CmdClose(void)
 		m_bufferSend[0] = CMD_CLOSE;
 		Send(&m_bufferSend[0], 1);
 	}
+	m_isConnected = 0;
+	// a deliberate close is never auto-undone by the reconnect watchdog
+	m_initHost[0] = '\0';
+	m_switchresValid = 0;
+	m_noAckBlitCount = 0;
+	teardownVideo();
+	if (inputsBound())
+	{
+#ifdef _WIN32
+		::closesocket(m_sockInputsFD);
+		m_sockInputsFD = INVALID_SOCKET;
+		::WSACleanup(); // pairs BindInputs' WSAStartup
+#else
+		close(m_sockInputsFD);
+		m_sockInputsFD = -1;
+#endif
+	}
+}
+
+// Tear down the video-side resources (RIO queues/buffers + video socket)
+// exactly once per CmdInit — idempotent, so a failed CmdInit's internal
+// cleanup followed by the host's own CmdClose() is safe (previously that
+// double-ran closesocket + WSACleanup). The inputs socket is deliberately
+// NOT touched here: CmdInit never created it, and the auto-reconnect path
+// must keep it (and its local port) alive so the core's stored subscribe
+// address stays valid across the reconnect.
+void GroovyMister::teardownVideo(void)
+{
+	if (m_videoTorndown)
+	{
+		return;
+	}
+	m_videoTorndown = 1;
 #ifdef _WIN32
 	if (USE_RIO)
 	{
@@ -187,12 +354,74 @@ void GroovyMister::CmdClose(void)
 
 	}
 	::closesocket(m_sockFD);
-	::closesocket(m_sockInputsFD);
-	::WSACleanup();
+	m_sockFD = INVALID_SOCKET;
+	::WSACleanup(); // pairs CmdInit's WSAStartup
 #else
-	close(m_sockFD);
-	close(m_sockInputsFD);
+	if (m_sockFD >= 0)
+	{
+		close(m_sockFD);
+	}
+	m_sockFD = -1;
 #endif
+}
+
+uint8_t GroovyMister::inputsBound(void)
+{
+#ifdef _WIN32
+	return (m_sockInputsFD != INVALID_SOCKET) ? 1 : 0;
+#else
+	return (m_sockInputsFD >= 0) ? 1 : 0;
+#endif
+}
+
+uint64_t GroovyMister::monotonicMs(void)
+{
+#ifdef _WIN32
+	return (uint64_t)GetTickCount64();
+#else
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000ULL + (uint64_t)(t.tv_nsec / 1000000);
+#endif
+}
+
+void GroovyMister::CmdSendClose(void)
+{
+	if (m_isConnected)
+	{
+		m_bufferSend[0] = CMD_CLOSE;
+		sendto(m_sockFD, (char *) &m_bufferSend[0], 1, 0, (struct sockaddr *)&m_serverAddr, sizeof(m_serverAddr));
+	}
+}
+
+void GroovyMister::ResendInputSubscribe(void)
+{
+	if (!inputsBound())
+	{
+		return;
+	}
+	// mirrors the sendto in BindInputs: the core only checks len==1
+	sendto(m_sockInputsFD, m_bufferSend, 1, 0, (struct sockaddr *)&m_serverAddrInputs, sizeof(m_serverAddrInputs));
+}
+
+uint8_t GroovyMister::isConnected(void)
+{
+	return m_isConnected;
+}
+
+uint8_t GroovyMister::getInputCaps(void)
+{
+	return m_isConnected ? m_negotiatedCaps : 0;
+}
+
+void GroovyMister::setAutoReconnect(uint8_t on)
+{
+	m_autoReconnect = on ? 1 : 0;
+}
+
+uint32_t GroovyMister::reconnectEpoch(void)
+{
+	return m_reconnectEpoch;
 }
 
 void GroovyMister::setVerbose(uint8_t sev)
@@ -200,9 +429,61 @@ void GroovyMister::setVerbose(uint8_t sev)
 	m_verbose = sev;
 }
 
+void GroovyMister::setFrameDump(const char* dir, uint32_t maxFrames)
+{
+	if (!dir || !dir[0]) { m_dumpFrames = 0; return; }
+	strncpy(m_dumpDir, dir, sizeof(m_dumpDir) - 1);
+	m_dumpDir[sizeof(m_dumpDir) - 1] = '\0';
+	m_dumpMax = maxFrames ? maxFrames : 120;
+	m_dumpCount = 0;
+	m_dumpFrames = 1;
+	LOG(0, "[MiSTer] Frame dump enabled -> %s (max %u frames)\n", m_dumpDir, m_dumpMax);
+}
+
+void GroovyMister::DumpFrame(uint8_t field)
+{
+	// Write the raw, pre-compression frame so tools/nlc_bench can measure real
+	// content. Dimensions are encoded in the filename; rows derive from the actual
+	// buffer size so interlaced fields are captured correctly.
+	if (!m_dumpFrames || m_dumpCount >= m_dumpMax) return;
+	int W = m_nlcWidth;
+	uint8_t bpp = (m_rgbMode == 1) ? 4 : (m_rgbMode == 2) ? 2 : 3;
+	if (W <= 0 || m_RGBSize == 0) return;
+	int rows = m_RGBSize / (W * bpp);
+	const char* fmt = (m_rgbMode == 1) ? "rgba" : (m_rgbMode == 2) ? "565" : "888";
+	char path[320];
+	snprintf(path, sizeof(path), "%s/frame_%dx%d_%s_%06u.raw", m_dumpDir, W, rows, fmt, m_dumpCount);
+	FILE* fp = fopen(path, "wb");
+	if (!fp) { LOG(0, "[MiSTer] Frame dump: cannot open %s\n", path); m_dumpFrames = 0; return; }
+	fwrite(m_pBufferBlit[field], 1, m_RGBSize, fp);
+	fclose(fp);
+	m_dumpCount++;
+	if (m_dumpCount >= m_dumpMax) LOG(0, "[MiSTer] Frame dump complete: %u frames in %s\n", m_dumpCount, m_dumpDir);
+}
+
 const char* GroovyMister::getVersion()
 {
 	return &GROOVYMISTER_VERSION[0];
+}
+
+void GroovyMister::setNlcDispMode(uint8_t mode)
+{
+	m_nlcDispMode = (mode <= 3) ? mode : 2;   // sent in CMD_INIT byte[1] bits [6:5]
+}
+
+void GroovyMister::setNlcPack(uint8_t pack)
+{
+	m_nlcPack = (pack == 2) ? 2 : 1;          // sent in CMD_INIT byte[1] bit 7 (1 = RICE)
+}
+
+void GroovyMister::setNearLevel(uint8_t lvl)
+{
+	m_nearLevel = (lvl <= 3) ? lvl : 0;       // sent in CMD_INIT byte[1] bits [3:2]
+}
+
+void GroovyMister::setInputCaps(uint8_t caps)
+{
+	m_inputCaps = caps;                       // sent as CMD_INIT byte[5] (len-6 init; 0 = len-5, legacy)
 }
 
 int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Frames, uint32_t soundRate, uint8_t soundChan, uint8_t rgbMode, uint16_t mtu)
@@ -438,6 +719,40 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 	}
 #endif
 
+	m_videoTorndown = 0; // video-side resources live from here; re-arm teardownVideo()
+	m_rioSendPosted = 0;
+	m_rioSendFailed = 0;
+	m_rioSendDrained = 0;
+	m_rioRecvRepostFailed = 0;
+	m_rioAckTimeout = 0;
+
+	// Caps negotiation: a len-6 CMD_INIT is silently DISCARDED by cores older
+	// than GROOVY_VERSION 2 (their length check rejects it, no ACK), so probe
+	// the version first and drop to a len-5 init (v1 inputs) when the core
+	// can't take the caps byte. getInputCaps() exposes the outcome.
+	m_negotiatedCaps = m_inputCaps;
+	uint8_t rioRecvPosted = 0;
+	(void) rioRecvPosted; // only read on the _WIN32 RIO path
+	if (m_inputCaps)
+	{
+		m_core_version = 0;
+		m_bufferSend[0] = CMD_GET_VERSION;
+		Send(&m_bufferSend[0], 1);
+#ifdef _WIN32
+		if (USE_RIO)
+		{
+			m_rio.RIOReceive(m_requestQueue, &m_receiveRioBuffer, 1, 0, &m_receiveRioBuffer);
+			rioRecvPosted = 1; // getACK re-posts on consume; if the probe times out the post stays outstanding
+		}
+#endif
+		getACK(60);
+		if (m_core_version < 2)
+		{
+			LOG(0,"[MiSTer] Core version %d < 2: no caps support, falling back to v1 inputs\n", m_core_version);
+			m_negotiatedCaps = 0;
+		}
+	}
+
 	LOG(0,"[MiSTer] Sending CMD_INIT...lz4 %d sound_rate %d sound_chan %d rgb_mode %d mtu %d\n", lz4Frames, soundRate, soundChan, rgbMode, mtu);
 
 	m_lz4Frames = lz4Frames;
@@ -445,15 +760,22 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 	m_rgbMode = rgbMode;
 
 	m_bufferSend[0] = CMD_INIT;
-	m_bufferSend[1] = (lz4Frames) ? 1 : 0; //0-RAW or 1-LZ4 ;
+	// codec byte: RAW=0, LZ4=1 (bare); NLC packs codec=2 + near + colour + pack
+	// ([1:0]=codec [3:2]=near [4]=colour [6:5]=dispMode [7]=RICE — R5 negotiation bit).
+	// The HPS reads codec via &3; old cores see >1 and fall back to raw as intended.
+	m_bufferSend[1] = (lz4Frames == GM_CODEC_NLC_TILED)
+	                ? (char)(2 | ((m_nearLevel & 0x3) << 2) | (1 << 4) | ((m_nlcDispMode & 0x3) << 5) | ((m_nlcPack == 2 ? 1 : 0) << 7))
+	                : (lz4Frames) ? 1 : 0;
 	m_bufferSend[2] = (soundRate == 22050) ? 1 : (soundRate == 44100) ? 2 : (soundRate == 48000) ? 3 : 0;
 	m_bufferSend[3] = soundChan;
 	m_bufferSend[4] = rgbMode;
+	m_bufferSend[5] = m_negotiatedCaps;
 
-	Send(&m_bufferSend[0], 5);
+	// len-5 init stays byte-identical for older cores; caps ride an extra byte
+	Send(&m_bufferSend[0], m_negotiatedCaps ? 6 : 5);
 
 #ifdef _WIN32
-	if (USE_RIO)
+	if (USE_RIO && !rioRecvPosted)
 	{
 		m_rio.RIOReceive(m_requestQueue, &m_receiveRioBuffer, 1, 0, &m_receiveRioBuffer);
 	}
@@ -463,7 +785,7 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 	if (!ackTime)
 	{
 		LOG(0,"[MiSTer] ACK failed with %d ms\n", 60);
-		CmdClose();
+		teardownVideo(); // inputs socket (if bound) stays alive; full cleanup is the host's CmdClose()
 		return -1;
 	}
 	else
@@ -488,6 +810,18 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 		LOG(0,"[MiSTer] Version %d received 10 times with ping %f ms\n", m_core_version, (double) m_network_ping / 10000);
 */
 		m_isConnected = 1;
+		// stash the params for the setAutoReconnect watchdog
+		strncpy(m_initHost, misterHost, sizeof(m_initHost) - 1);
+		m_initHost[sizeof(m_initHost) - 1] = '\0';
+		m_initPort = misterPort;
+		m_initLz4Frames = lz4Frames;
+		m_initSoundRate = soundRate;
+		m_initSoundChan = soundChan;
+		m_initRgbMode = rgbMode;
+		m_initMtu = mtu;
+		m_lastFrameEchoSeen = 0;
+		m_noAckBlitCount = 0;
+		LOG(0,"[MiSTer] Connected: core ver %d, CMD_INIT byte1=0x%02x caps=0x%02x\n", m_core_version, (uint8_t) m_bufferSend[1], m_negotiatedCaps);
 		return 0;
 	}
 
@@ -501,6 +835,7 @@ void GroovyMister::CmdSwitchres(double pClock, uint16_t hActive, uint16_t hBegin
 	uint8_t interlace_modeline = (interlace != 2) ? interlace : 1;
 
 	m_RGBSize = (m_rgbMode == 1) ? (hActive * vActive) << 2 : (m_rgbMode == 2) ? (hActive * vActive) << 1 : hActive * vActive * 3;
+	m_nlcWidth = hActive;   // for nlc_encode
 
 	if (interlace == 1)
 	{
@@ -528,13 +863,102 @@ void GroovyMister::CmdSwitchres(double pClock, uint16_t hActive, uint16_t hBegin
 	memcpy(&m_bufferSend[25],&interlace,sizeof(interlace));
 
 	Send(&m_bufferSend[0], 26);
+
+	// stash the modeline so the setAutoReconnect watchdog can replay it after
+	// an internal reconnect (the caller never has to detect the reconnect)
+	m_switchresValid = 1;
+	m_initPClock    = pClock;
+	m_initHActive   = hActive;
+	m_initHBegin    = hBegin;
+	m_initHEnd      = hEnd;
+	m_initHTotal    = hTotal;
+	m_initVActive   = vActive;
+	m_initVBegin    = vBegin;
+	m_initVEnd      = vEnd;
+	m_initVTotal    = vTotal;
+	m_initInterlace = interlace;
 }
 
 void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, uint32_t margin, uint32_t matchDeltaBytes)
 {
 	if (!m_isConnected)
-	  return;
-	  
+	{
+		// after a FAILED auto-reconnect the session is down but the watchdog
+		// stays armed: fall through so the rate-limited retry below can run
+		// (otherwise "retry in 1s" could never fire — this early-out would
+		// block it forever)
+		if (!(m_autoReconnect && m_noAckBlitCount >= 10 && m_initHost[0] != '\0'))
+		{
+			return;
+		}
+	}
+
+	// Opt-in ACK watchdog (setAutoReconnect): fpga.frameEcho is refreshed by
+	// getACK() from WaitSync/DiffTimeRaster; if it stops advancing across
+	// blits the core has gone silent. Warn at 5 misses, reconnect at 10
+	// (~167ms at 60Hz), rate-limited to one attempt per second. The reconnect
+	// tears down ONLY the video side — the inputs socket and its local port
+	// survive, so the subscribe re-sent around the inner CmdInit restores the
+	// pad stream (the pre-init send lands in the core's one-shot CMD_INIT
+	// read; the post-init send is UDP-loss insurance for address-aware cores).
+	if (m_autoReconnect)
+	{
+		if (fpga.frameEcho > m_lastFrameEchoSeen)
+		{
+			m_lastFrameEchoSeen = fpga.frameEcho;
+			m_noAckBlitCount = 0;
+		}
+		else if (m_frame > 0)
+		{
+			m_noAckBlitCount++;
+			if (m_noAckBlitCount == 5)
+			{
+				LOG(0,"[MiSTer] WARNING: no ACK advance for 5 blits (lastEcho=%u, sending=%u)\n", fpga.frameEcho, frame);
+			}
+			if (m_noAckBlitCount >= 10 && m_initHost[0] != '\0')
+			{
+				uint64_t nowMs = monotonicMs();
+				if (m_lastReconnectAttemptMs != 0 && (nowMs - m_lastReconnectAttemptMs) < 1000)
+				{
+					// inside the back-off window; stay primed to retry the
+					// moment it elapses instead of needing 10 fresh misses
+					m_noAckBlitCount = 10;
+					return;
+				}
+				m_lastReconnectAttemptMs = nowMs;
+
+				// CmdInit re-stashes into m_initHost — snapshot it first
+				char savedHost[sizeof(m_initHost)];
+				memcpy(savedHost, m_initHost, sizeof(savedHost));
+
+				LOG(0,"[MiSTer] No ACK advance for %u blits: reconnecting to %s:%u\n", m_noAckBlitCount, savedHost, m_initPort);
+				CmdSendClose();  // plain sendto: delivers even if the RIO queues are wedged
+				m_isConnected = 0;
+				teardownVideo(); // inputs socket deliberately untouched
+				ResendInputSubscribe(); // queue a fresh subscribe for the core's CMD_INIT one-shot read
+				int rc = CmdInit(savedHost, m_initPort, m_initLz4Frames, m_initSoundRate, m_initSoundChan, m_initRgbMode, m_initMtu);
+				if (rc == 0)
+				{
+					ResendInputSubscribe();
+					if (m_switchresValid)
+					{
+						CmdSwitchres(m_initPClock, m_initHActive, m_initHBegin, m_initHEnd, m_initHTotal, m_initVActive, m_initVBegin, m_initVEnd, m_initVTotal, m_initInterlace);
+					}
+					m_reconnectEpoch++;
+					LOG(0,"[MiSTer] Reconnect OK (epoch %u)%s\n", m_reconnectEpoch, m_switchresValid ? ", modeline replayed" : "");
+				}
+				else
+				{
+					LOG(0,"[MiSTer] Reconnect failed (rc=%d); retrying in 1s\n", rc);
+					m_noAckBlitCount = 10;
+				}
+				// either way this blit is skipped: the send buffers/queues
+				// were just rebuilt (or are down)
+				return;
+			}
+		}
+	}
+
 	m_frame = frame;
 	uint16_t vSync = vCountSync;
 
@@ -551,11 +975,33 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 		}
 	}
 
+	if (m_dumpFrames) DumpFrame(field);   // corpus capture: raw pre-compression frame
 	uint32_t cSize = 0;
 	uint32_t cSizeDelta = 0;
 	uint32_t bytesToSend = 0;
 	double ratio_delta = 1.0;
-	if (m_lz4Frames)
+	if (m_lz4Frames == GM_CODEC_NLC_TILED)
+	{
+		// NLC tiled (block-adaptive near-lossless): encodes the RAW frame (its own colour transform +
+		// predictor). Output replaces the LZ4 buffer; reuses the 12-byte cSize blit header (no delta).
+		if (m_preEncodedSize)
+		{
+			// pre-encode fast path: the caller already wrote an EncodeNLC frame into getPBufferPreEncoded()
+			// (the per-blit software encode dominates the frame period on slow CPUs, e.g. ~40ms on the
+			// MiSTer's Cortex-A9 at 240p — pre-encoding each unique frame once restores full send cadence)
+			cSize = m_preEncodedSize;
+			m_preEncodedSize = 0;
+		}
+		else
+		{
+			nlc_params np;
+			buildNlcParams(&np);
+			int r = nlc_encode((const uint8_t*)&m_pBufferBlit[field][0], (uint8_t*)m_pBufferLZ4[0], BUFFER_SIZE, &np);
+			cSize = (r > 0) ? (uint32_t)r : 0;   // 0 -> raw fallback
+		}
+		cSizeDelta = cSize;
+	}
+	else if (m_lz4Frames)
 	{
 		double ratio_match = (double) matchDeltaBytes / m_RGBSize;
 		if (!(m_lz4Frames % 2 == 0) || ratio_match < 1 || !m_delta_enabled[field]) // duplicated frame, compress only delta
@@ -703,10 +1149,10 @@ uint32_t GroovyMister::getACK(DWORD dwMilliseconds)
 			RIORESULT results[RIO_MAX_RESULTS];
 			ULONG numResults = m_rio.RIODequeueCompletion(m_receiveQueue, results, RIO_MAX_RESULTS);
 			ULONG idx;
-			while (numResults)
+			while (numResults && numResults != RIO_CORRUPT_CQ)
 			{
-				idx=0;
-				do
+				// (was a do/while running to idx <= numResults: one stale entry past the end)
+				for (idx = 0; idx < numResults; idx++)
 				{
 					if (results[idx].BytesTransferred == 13) //blit ACK
 					{
@@ -738,11 +1184,17 @@ uint32_t GroovyMister::getACK(DWORD dwMilliseconds)
 						}
 						memcpy(&m_core_version, &m_bufferReceive[0], 1);
 					}
-					idx++;
-				} while (idx <= numResults);
-				numResults = m_rio.RIODequeueCompletion(m_receiveQueue, results, numResults);
+				}
+				numResults = m_rio.RIODequeueCompletion(m_receiveQueue, results, RIO_MAX_RESULTS);
 			}
-			m_rio.RIOReceive(m_requestQueue, &m_receiveRioBuffer, 1, 0, &m_receiveRioBuffer);
+			if (!m_rio.RIOReceive(m_requestQueue, &m_receiveRioBuffer, 1, 0, &m_receiveRioBuffer))
+			{
+				m_rioRecvRepostFailed++;
+			}
+		}
+		else if (dwMilliseconds > 0)
+		{
+			m_rioAckTimeout++;
 		}
 		m_rio.RIONotify(m_receiveQueue);
 		return getACKresult;
@@ -778,6 +1230,38 @@ uint32_t GroovyMister::getACK(DWORD dwMilliseconds)
 	return getACKresult;
 }
 
+// Empty the send completion queue. Nothing ever dequeued m_sendQueue, so send
+// completions accumulated against the BUFFER_SLICES-deep CQ; once full,
+// RIOSend (and the CQ-sharing RIOReceive re-post) fail silently and datagrams
+// drop — seen in the field as an audio-load stall with false "no ACK"
+// reconnects (audio doubles the send rate). Called every frame from WaitSync.
+uint32_t GroovyMister::drainSendCompletions(void)
+{
+#ifdef _WIN32
+	if (USE_RIO)
+	{
+		RIORESULT results[256];
+		uint32_t total = 0;
+		for (;;)
+		{
+			ULONG n = m_rio.RIODequeueCompletion(m_sendQueue, results, 256);
+			if (n == 0 || n == RIO_CORRUPT_CQ)
+			{
+				break;
+			}
+			total += n;
+			if (n < 256)
+			{
+				break;
+			}
+		}
+		m_rioSendDrained += total;
+		return total;
+	}
+#endif
+	return 0;
+}
+
 void GroovyMister::WaitSync(void)
 {
 	if (!m_isConnected)
@@ -807,6 +1291,26 @@ void GroovyMister::WaitSync(void)
 	{
 		LOG(1,"[MiSTer] Frame %d Sleep prev=%d/final=%d/real=%d (frameTime=%d blitTime=%d emulationTime=%d) (vcount_vsync=%d/%d vcount_gpu=%d/%d)\n", m_frame, prevSleepTime, sleepTime, realTime, m_frameTime, m_streamTime, m_emulationTime, fpga.frameEcho, fpga.vCountEcho, fpga.frame, fpga.vCount);
 	}
+
+	// keep the send CQ empty + emit the telemetry summary every ~2s at
+	// verbose level 1 (watch sendFailed/recvRepostFailed climbing alongside
+	// ackTimeout — that is the send-CQ-full fingerprint)
+#ifdef _WIN32
+	if (USE_RIO)
+	{
+		drainSendCompletions();
+		uint64_t nowMs = monotonicMs();
+		if (m_rioLastSummaryMs == 0 || (nowMs - m_rioLastSummaryMs) >= 2000)
+		{
+			m_rioLastSummaryMs = nowMs;
+			LOG(1,"[MiSTer][RIO] frame=%u sendPosted=%llu sendFailed=%llu sendDrained=%llu recvRepostFailed=%llu ackTimeout=%llu noAck=%u\n",
+				m_frame,
+				(unsigned long long)m_rioSendPosted, (unsigned long long)m_rioSendFailed,
+				(unsigned long long)m_rioSendDrained, (unsigned long long)m_rioRecvRepostFailed,
+				(unsigned long long)m_rioAckTimeout, m_noAckBlitCount);
+		}
+	}
+#endif
 }
 
 int GroovyMister::DiffTimeRaster(void)
@@ -895,6 +1399,10 @@ void GroovyMister::BindInputs(const char* misterHost, uint16_t misterPort)
 
 void GroovyMister::PollInputs(void)
 {
+	if (!inputsBound())
+	{
+		return;
+	}
 	uint32_t joyFrame = joyInputs.joyFrame;
 	uint8_t  joyOrder = joyInputs.joyOrder;
 	uint32_t ps2Frame = ps2Inputs.ps2Frame;
@@ -904,7 +1412,7 @@ void GroovyMister::PollInputs(void)
 	do
 	{
 		len = recvfrom(m_sockInputsFD, m_bufferInputsReceive, sizeof(m_bufferInputsReceive), 0, (struct sockaddr *)&m_serverAddrInputs, &sServerAddr);
-		if (len == 9 || len == 17) //blit joystick digital or analog
+		if (len == 9 || len == 17 || len == 13 || len == 25) //blit joystick digital or analog (v1/v2)
 		{
 			memcpy(&joyFrame, &m_bufferInputsReceive[0], 4);
 			memcpy(&joyOrder, &m_bufferInputsReceive[4], 1);
@@ -923,6 +1431,24 @@ void GroovyMister::PollInputs(void)
 			}
 		}
 	} while (len > 0);
+}
+
+void GroovyMister::SendRumble(uint8_t player, uint8_t strong, uint8_t weak)
+{
+	// rides the inputs socket (same one BindInputs registered); the core drops it
+	// unless CMD_INIT advertised GM_CAP_RUMBLE and the OSD Rumble option is On.
+	// Guarded: previously this sendto'd an uninitialized socket if BindInputs
+	// was never called, and a v1-fallback session must not emit rumble at all.
+	if (!m_isConnected || !inputsBound() || !(m_negotiatedCaps & GM_CAP_RUMBLE))
+	{
+		return;
+	}
+	char msg[4];
+	msg[0] = (char) player;
+	msg[1] = (char) strong;
+	msg[2] = (char) weak;
+	msg[3] = 0;
+	sendto(m_sockInputsFD, msg, 4, 0, (struct sockaddr *)&m_serverAddrInputs, sizeof(m_serverAddrInputs));
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1005,12 +1531,20 @@ if (USE_RIO)
 		if (whichBuffer == 0)
 		{
 			m_pBufsBlit[field][i].Length = (bytesToSend - bytesSended >= m_mtu) ? m_mtu : bytesToSend - bytesSended;
-			m_rio.RIOSend(m_requestQueue, &m_pBufsBlit[field][i], 1, flags, &m_pBufsBlit[field][i]);
+			m_rioSendPosted++;
+			if (!m_rio.RIOSend(m_requestQueue, &m_pBufsBlit[field][i], 1, flags, &m_pBufsBlit[field][i]))
+			{
+				m_rioSendFailed++;
+			}
 		}
 		else
 		{
 			m_pBufsAudio[i].Length = (bytesToSend - bytesSended >= m_mtu) ? m_mtu : bytesToSend - bytesSended;
-			m_rio.RIOSend(m_requestQueue, &m_pBufsAudio[i], 1, flags, &m_pBufsAudio[i]);
+			m_rioSendPosted++;
+			if (!m_rio.RIOSend(m_requestQueue, &m_pBufsAudio[i], 1, flags, &m_pBufsAudio[i]))
+			{
+				m_rioSendFailed++;
+			}
 		}
 		bytesSended += m_mtu;
 		i++;
@@ -1108,21 +1642,42 @@ void GroovyMister::setFpgaJoystick(int len)
 {
 	memcpy(&joyInputs.joyFrame, &m_bufferInputsReceive[0], 4);
 	memcpy(&joyInputs.joyOrder, &m_bufferInputsReceive[4], 1);
-	memcpy(&joyInputs.joy1, &m_bufferInputsReceive[5], 2);
-	memcpy(&joyInputs.joy2, &m_bufferInputsReceive[7], 2);
+	int analogOfs = 0;
+	if (len == 9 || len == 17) // v1: 16-bit button masks
+	{
+		joyInputs.joy1 = 0;
+		joyInputs.joy2 = 0;
+		memcpy(&joyInputs.joy1, &m_bufferInputsReceive[5], 2);
+		memcpy(&joyInputs.joy2, &m_bufferInputsReceive[7], 2);
+		if (len == 17) analogOfs = 9;
+	}
+	else // v2 (13/25): 32-bit button masks
+	{
+		memcpy(&joyInputs.joy1, &m_bufferInputsReceive[5], 4);
+		memcpy(&joyInputs.joy2, &m_bufferInputsReceive[9], 4);
+		if (len == 25) analogOfs = 13;
+	}
 	LOG(2,"[MiSTer] JOY %d %d / %d %d\n", joyInputs.joyFrame, joyInputs.joyOrder, joyInputs.joy1, joyInputs.joy2);
 
-	if (len == 17)
+	if (analogOfs)
 	{
-		memcpy(&joyInputs.joy1LXAnalog, &m_bufferInputsReceive[9], 1);
-		memcpy(&joyInputs.joy1LYAnalog, &m_bufferInputsReceive[10], 1);
-		memcpy(&joyInputs.joy1RXAnalog, &m_bufferInputsReceive[11], 1);
-		memcpy(&joyInputs.joy1RYAnalog, &m_bufferInputsReceive[12], 1);
-		memcpy(&joyInputs.joy2LXAnalog, &m_bufferInputsReceive[13], 1);
-		memcpy(&joyInputs.joy2LYAnalog, &m_bufferInputsReceive[14], 1);
-		memcpy(&joyInputs.joy2RXAnalog, &m_bufferInputsReceive[15], 1);
-		memcpy(&joyInputs.joy2RYAnalog, &m_bufferInputsReceive[16], 1);
+		memcpy(&joyInputs.joy1LXAnalog, &m_bufferInputsReceive[analogOfs + 0], 1);
+		memcpy(&joyInputs.joy1LYAnalog, &m_bufferInputsReceive[analogOfs + 1], 1);
+		memcpy(&joyInputs.joy1RXAnalog, &m_bufferInputsReceive[analogOfs + 2], 1);
+		memcpy(&joyInputs.joy1RYAnalog, &m_bufferInputsReceive[analogOfs + 3], 1);
+		memcpy(&joyInputs.joy2LXAnalog, &m_bufferInputsReceive[analogOfs + 4], 1);
+		memcpy(&joyInputs.joy2LYAnalog, &m_bufferInputsReceive[analogOfs + 5], 1);
+		memcpy(&joyInputs.joy2RXAnalog, &m_bufferInputsReceive[analogOfs + 6], 1);
+		memcpy(&joyInputs.joy2RYAnalog, &m_bufferInputsReceive[analogOfs + 7], 1);
 		LOG(2,"[MiSTer] JOY A1(LX=%d,LY=%d,RX=%d,RY=%d) A2(LX=%d,LY=%d,RX=%d,RY=%d)\n", joyInputs.joy1LXAnalog, joyInputs.joy1LYAnalog, joyInputs.joy1RXAnalog, joyInputs.joy1RYAnalog, joyInputs.joy2LXAnalog, joyInputs.joy2LYAnalog, joyInputs.joy2RXAnalog, joyInputs.joy2RYAnalog);
+	}
+	if (len == 25) // v2 analog carries the triggers too
+	{
+		memcpy(&joyInputs.joy1LTAnalog, &m_bufferInputsReceive[21], 1);
+		memcpy(&joyInputs.joy1RTAnalog, &m_bufferInputsReceive[22], 1);
+		memcpy(&joyInputs.joy2LTAnalog, &m_bufferInputsReceive[23], 1);
+		memcpy(&joyInputs.joy2RTAnalog, &m_bufferInputsReceive[24], 1);
+		LOG(2,"[MiSTer] JOY T1(L=%u,R=%u) T2(L=%u,R=%u)\n", joyInputs.joy1LTAnalog, joyInputs.joy1RTAnalog, joyInputs.joy2LTAnalog, joyInputs.joy2RTAnalog);
 	}
 }
 

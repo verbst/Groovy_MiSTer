@@ -38,6 +38,9 @@
 #include "pll.h"
 #include "utils.h"
 
+// fork (input.cpp): route client-requested rumble to a player's pad (1-based player)
+void input_rumble_player(int player, uint16_t rumble_val);
+
 // USER_IO
 static constexpr auto SCANDOUBLER_OPT = "[4:3]";
 static constexpr auto ASPECT_RATIO_OPT = "[2:1]";
@@ -59,6 +62,9 @@ static constexpr auto ARM_CLOCK_OPT = "[45:44]";
 static constexpr auto JUMBO_FRAMES_OPT = "[42]";
 static constexpr auto PS2_INPUTS_OPT = "[39:38]";
 static constexpr auto JOY_INPUTS_OPT = "[41:40]";
+// (no rumble option here: rumble is gated per pad in the Controllers page and globally by
+// MiSTer.ini RUMBLE. An OSD option used to live on [42] and silently shared that bit with
+// JUMBO_FRAMES_OPT above — see build_output/BUG_rumble_jumbo_status_bit42.md.)
 static constexpr auto VERBOSE_OPT = "[28:27]";
 static constexpr auto BLIT_OPT = "[29]";
 static constexpr auto AUDIO_RATE_OPT = "[53:52]";
@@ -78,7 +84,10 @@ static constexpr auto SERVER_TYPE_OPT = "[59]";
 #define UIO_SET_GROOVY_BLIT_FIELD_LZ4 0xf8
 
 // FPGA DDR shared
-#define BASEADDR 0x1C000000
+#define BASEADDR 0x30000000 // /51: standard MiSTer core DDR window, OUTSIDE Linux RAM.
+                                // 0x1C000000 sat inside mem=511M => kernel pages collided with
+                                // the FPGA/app buffer (the /49-/51 corruption). MUST match
+                                // rtl/ddram.sv's DDRAM_ADDR prefix (ship RBF+HPS together).
 #define HEADER_LEN 0xff
 #define CHUNK 7
 #define HEADER_OFFSET HEADER_LEN - CHUNK
@@ -107,7 +116,10 @@ static constexpr auto SERVER_TYPE_OPT = "[59]";
 #define INVALID_UMEM_FRAME UINT64_MAX
 #endif
 
-#define GROOVY_VERSION 1
+// v2: CMD_INIT accepts the optional 6th byte (client caps, CAP_*). Clients
+// probe this with CMD_GET_VERSION before sending a len-6 init — pre-v2 cores
+// silently discard any CMD_INIT length they don't recognise.
+#define GROOVY_VERSION 2
 
 // GroovyMiSTer protocol
 #define CMD_CLOSE 1
@@ -224,6 +236,11 @@ typedef struct {
    char      PoC_joystick_r_analog_X2;
    char      PoC_joystick_r_analog_Y2;
 
+   uint8_t   PoC_joystick_l_trigger1;   // analog triggers (inputs protocol v2 only)
+   uint8_t   PoC_joystick_r_trigger1;
+   uint8_t   PoC_joystick_l_trigger2;
+   uint8_t   PoC_joystick_r_trigger2;
+
    //ps2
    uint32_t  PoC_ps2_keep_alive;
    uint8_t   PoC_ps2_order;
@@ -295,6 +312,8 @@ static uint32_t ip_check_1 = 0;
 static uint32_t ip_check_13 = 0;
 static uint32_t inputs_ip_check_9 = 0;
 static uint32_t inputs_ip_check_17 = 0;
+static uint32_t inputs_ip_check_13 = 0;
+static uint32_t inputs_ip_check_25 = 0;
 static uint32_t inputs_ip_check_37 = 0;
 static uint32_t inputs_ip_check_41 = 0;
 
@@ -302,6 +321,8 @@ static uint32_t udp_check_1 = 0;
 static uint32_t udp_check_13 = 0;
 static uint32_t inputs_udp_check_9 = 0;
 static uint32_t inputs_udp_check_17 = 0;
+static uint32_t inputs_udp_check_13 = 0;
+static uint32_t inputs_udp_check_25 = 0;
 static uint32_t inputs_udp_check_37 = 0;
 static uint32_t inputs_udp_check_41 = 0;
 #endif
@@ -319,6 +340,11 @@ static uint8_t *map = 0;
 static uint8_t* buffer;
 
 static int blitCompression = 0;
+static uint8_t codecMode = 0;   // 0=raw 1=LZ4 2=NLC (from CMD_INIT byte[1] bits [1:0])
+static uint8_t nlcNear   = 0;   // NLC NEAR level (bits [3:2])
+static uint8_t nlcColor  = 1;   // NLC colour: 1=YCoCg (bit [4])
+static uint8_t nlcDispMode = 0; // /47 NLC display path: 0=/45 stream, 2=autonomous engine (bits [6:5])
+static uint8_t nlcPack   = 0;   // R3: NLC entropy pack: 1=Golomb-Rice, 0=TILED (CMD_INIT byte[1] bit 7)
 static uint8_t audioRate = 0;
 static uint8_t audioChannels = 0;
 static uint8_t rgbMode = 0;
@@ -329,9 +355,57 @@ static int usingOldBlit = 0;
 
 static uint8_t hpsBlit = 0;
 static uint16_t numBlit = 0;
+
+// ---- /58 Phase 2: ingest receive modes --------------------------------------------------------
+// The blit hot path historically recvfrom()'d payloads DIRECTLY into the /dev/mem DDR window
+// (Device-uncached: shmem.cpp opens /dev/mem O_SYNC) — the kernel's copy into non-bufferable
+// memory is the measured ~38 MB/s ingest ceiling (/58: 527KB avg frames -> ~54fps effective).
+// GROOVY_RECV_MODE env or /media/fat/groovy_recv.cfg (single digit) selects at start:
+//   0 = legacy direct recvfrom into the DDR window (A/B baseline)
+//   1 = recvfrom into cached scratch + wide-store copy to the window (protocol-identical)
+//   2 = recvmmsg batch (up to RECV_BATCH dgrams/syscall) + wide-store copy + ONE FPGA blit
+//       notify per batch instead of per chunk (coarser watermark growth — proven safe: the
+//       engine promotes/finalizes per the /57 protocol invariant; end-of-frame notify unchanged)
+#define RECV_BATCH 32
+static int recvMode = 1;
+static uint8_t recvNotifyDefer = 0;              // mode 2 batch loop defers per-chunk ASAP notifies
+#ifdef MSG_WAITFORONE
+static struct mmsghdr recvMsgs[RECV_BATCH];
+static struct iovec recvIovs[RECV_BATCH];
+static struct sockaddr_in recvAddrs[RECV_BATCH];
+static char recvBatchBuf[RECV_BATCH][2048] __attribute__((aligned(64)));
+static uint8_t recvBatchReady = 0;
+#endif
+
+// Wide-store copy into the uncached window: on Device memory every store is its own bus beat,
+// so store WIDTH is everything (the kernel's alignment-safe path degrades to narrow copies).
+// All blit destinations are 8-aligned (HEADER_OFFSET=248, zone offsets 0x...000, 1472-byte
+// chunks), so the fast path always hits; anything else falls back to memcpy (already proven
+// against this window by the logo and XDP paths).
+static void ddr_wide_copy(char *dst, const char *src, int len)
+{
+	if (((((uintptr_t)dst) | ((uintptr_t)src)) & 7) == 0)
+	{
+		uint64_t *d = (uint64_t *)dst;
+		const uint64_t *s = (const uint64_t *)src;
+		while (len >= 64)
+		{
+			d[0]=s[0]; d[1]=s[1]; d[2]=s[2]; d[3]=s[3];
+			d[4]=s[4]; d[5]=s[5]; d[6]=s[6]; d[7]=s[7];
+			d += 8; s += 8; len -= 64;
+		}
+		while (len >= 8) { *d++ = *s++; len -= 8; }
+		dst = (char *)d; src = (const char *)s;
+	}
+	if (len > 0) memcpy(dst, src, len);
+}
 static uint8_t doScreensaver = 0;
 static uint8_t doPs2Inputs = 0;
 static uint8_t doJoyInputs = 0;
+// CMD_INIT byte[5] capability flags from the client (len-6 init; 0 = older client)
+#define CAP_INPUTS_V2 0x01  // 32-bit button masks + analog triggers in the joystick packet
+#define CAP_RUMBLE    0x02  // client may send rumble messages on the inputs socket
+static uint8_t clientCaps = 0;
 static uint8_t doJumboFrames = 0;
 #ifdef _AF_XDP
 static uint8_t doXDPServer = 1;
@@ -376,6 +450,21 @@ static uint32_t fpga_lz4_llegits = 0;
 static uint32_t fpga_lz4_subframe_bytes = 0;
 static uint16_t fpga_lz4_subframe_blit = 0;
 */
+
+// /55-/56 wedge telemetry (GET_GROOVY_STATUS words 10-13)
+// word10 (live_a): [7:0] blit FSM state, [11:8] NLC engine state, [13:12] ddr_mux2 grant
+//                  (0=M0 1=PEND 2=M1 3=DRAIN), [15:14] ddram state
+// word11 (live_b): [0] ddram read_req, [1] eng busy, [2] eng pend_valid, [3] freeze latched,
+//                  [7:4] engine wd_fired count (sat), [11:8] ddram read-watchdog count (sat),
+//                  [15:12] engine done_stb ROLLING count (publish rate: should tick ~1/poll)
+// word12: freeze latched ? freeze-time copy of word10 : engine cur_frame[15:0]
+// word13: freeze latched ? {vga_frame[11:0], audio, pend, busy, read_req} at the freeze
+//                        : {sync-loss count[3:0], engine FB flushed_bytes[15:4]}
+static uint16_t fpga_dbg_live_a = 0;
+static uint16_t fpga_dbg_live_b = 0;
+static uint16_t fpga_dbg_frz_a = 0;   // word12
+static uint16_t fpga_dbg_frz_b = 0;   // word13
+static uint8_t  dbgFreezeLogged = 0;
 
 static inline void initDDR()
 {
@@ -478,6 +567,21 @@ static void groovy_FPGA_status(uint8_t isACK)
 	if (blitCompression || doVerbose == 3)
 	{
 		fpga_lz4_uncompressed  = spi_w(0) | spi_w(0) << 16;
+
+		// /55 wedge telemetry (must mirror hps_ext.v words 10-13 exactly)
+		fpga_dbg_live_a = spi_w(0);
+		fpga_dbg_live_b = spi_w(0);
+		fpga_dbg_frz_a  = spi_w(0);
+		fpga_dbg_frz_b  = spi_w(0);
+
+		if ((fpga_dbg_live_b & 0x0008) && !dbgFreezeLogged)
+		{
+			dbgFreezeLogged = 1;
+			LOG(0, "[FREEZE_LATCH][fsm=%u eng=%u grant=%u ddram=%u rdreq=%u][eng_busy=%u pend=%u audio=%u vf=%u][live a=%04x b=%04x]\n",
+				fpga_dbg_frz_a & 0xff, (fpga_dbg_frz_a >> 8) & 0xf, (fpga_dbg_frz_a >> 12) & 0x3, (fpga_dbg_frz_a >> 14) & 0x3,
+				fpga_dbg_frz_b & 0x1, (fpga_dbg_frz_b >> 1) & 0x1, (fpga_dbg_frz_b >> 2) & 0x1, (fpga_dbg_frz_b >> 3) & 0x1,
+				(fpga_dbg_frz_b >> 4) & 0xfff, fpga_dbg_live_a, fpga_dbg_live_b);
+		}
 	}
 
 		// DEBUG 
@@ -560,7 +664,16 @@ static void groovy_FPGA_init(uint8_t cmd, uint8_t audio_rate, uint8_t audio_chan
     {
     	req = fpga_spi_fast(UIO_SET_GROOVY_INIT);
     } while (req == 0);
-    spi_w(cmd);
+    // cmd word = hps_ext SET_INIT m_temp: [0]=init, [2:1]=codec_mode, [4:3]=nlc_near, [5]=nlc_color.
+    uint16_t cmd_word = cmd;
+    if (cmd == 1) {
+        cmd_word |= (uint16_t)(codecMode & 0x3) << 1;
+        cmd_word |= (uint16_t)(nlcNear   & 0x3) << 3;
+        cmd_word |= (uint16_t)(nlcColor  & 0x1) << 5;
+        cmd_word |= (uint16_t)(nlcDispMode & 0x3) << 6;   // /47: hps_ext decodes m_temp[7:6] = nlc_disp_mode
+        cmd_word |= (uint16_t)(nlcPack   & 0x1) << 8;     // R3: hps_ext m_temp[8] = nlc_rice (Golomb-Rice pack)
+    }
+    spi_w(cmd_word);
     bitByte bits;
     bits.byte = audio_rate;
     bits.u.bit2 = (audio_chan == 1) ? 1 : 0;
@@ -751,7 +864,11 @@ static void setSwitchres(char *recvbuf)
     poc->PoC_VS = udp_vend - udp_vbegin;
     poc->PoC_VBP = udp_vtotal - udp_vend;
     
-    poc->PoC_ce_pix = (udp_pclock * 16 < 90) ? 16 : (udp_pclock * 12 < 90) ? 12 : (udp_pclock * 8 < 100) ? 8 : (udp_pclock * 6 < 100) ? 6 : 4; // we want at least 40Mhz clksys for vga scaler         
+    // ce_pix chooser: clk_sys = pclock * ce_pix. BOUND clk_sys <= ~83MHz — the FPGA's timing is analyzed at the
+    // PLL's configured 82.75MHz (the runtime PLL reconfig is invisible to STA); the old unbounded ladder produced
+    // 100.7MHz at 25.175MHz (31kHz 480p) = a 22% overclock = no sync at all (/42), and 87.9MHz at 14.655MHz (480i).
+    // Keep >=40MHz for the vga scaler; the NLC decoder needs >= ~2.1*pclock (ce_pix>=3 always satisfies it).
+    poc->PoC_ce_pix = (udp_pclock * 16 < 84) ? 16 : (udp_pclock * 12 < 84) ? 12 : (udp_pclock * 8 < 84) ? 8 : (udp_pclock * 6 < 84) ? 6 : (udp_pclock * 4 < 84) ? 4 : (udp_pclock * 3 < 84) ? 3 : 2;
     poc->PoC_interlaced = (udp_interlace >= 1) ? 1 : 0;
     poc->PoC_FB_progressive = (udp_interlace == 0 || udp_interlace == 2) ? 1 : 0;
     
@@ -837,6 +954,10 @@ static void setClose()
 	initDDR();
 	isConnected = 0;
 	isConnectedInputs = 0;
+	clientCaps = 0;
+	// halt any active rumble effect (uploaded effects run for up to 32s)
+	input_rumble_player(1, 0);
+	input_rumble_player(2, 0);
 
 	// load LOGO
 	if (doScreensaver)
@@ -882,27 +1003,60 @@ static void complete_tx(struct xsk_socket_info *xsk)
 static void groovy_send_joysticks()
 {
 	char* sendbufPtr = (doXDPServer) ? (char*) &sendbufInputs[42] : (char*) &sendbufInputs[0];
-	int len = 9;
+	int len;
 	sendbufPtr[0] = poc->PoC_frame_ddr & 0xff;
 	sendbufPtr[1] = poc->PoC_frame_ddr >> 8;
 	sendbufPtr[2] = poc->PoC_frame_ddr >> 16;
 	sendbufPtr[3] = poc->PoC_frame_ddr >> 24;
 	sendbufPtr[4] = poc->PoC_joystick_order;
-	sendbufPtr[5] = poc->PoC_joystick_map1 & 0xff;
-	sendbufPtr[6] = poc->PoC_joystick_map1 >> 8;
-	sendbufPtr[7] = poc->PoC_joystick_map2 & 0xff;
-	sendbufPtr[8] = poc->PoC_joystick_map2 >> 8;
-	if (doJoyInputs == 2)
+	if (clientCaps & CAP_INPUTS_V2)
 	{
-		sendbufPtr[9]  = poc->PoC_joystick_l_analog_X1;
-		sendbufPtr[10] = poc->PoC_joystick_l_analog_Y1;
-		sendbufPtr[11] = poc->PoC_joystick_r_analog_X1;
-		sendbufPtr[12] = poc->PoC_joystick_r_analog_Y1;
-		sendbufPtr[13] = poc->PoC_joystick_l_analog_X2;
-		sendbufPtr[14] = poc->PoC_joystick_l_analog_Y2;
-		sendbufPtr[15] = poc->PoC_joystick_r_analog_X2;
-		sendbufPtr[16] = poc->PoC_joystick_r_analog_Y2;
-		len += 8;
+		// v2: 32-bit masks (buttons 16-31 headroom) + analog triggers; len 13/25
+		sendbufPtr[5]  = poc->PoC_joystick_map1 & 0xff;
+		sendbufPtr[6]  = poc->PoC_joystick_map1 >> 8;
+		sendbufPtr[7]  = poc->PoC_joystick_map1 >> 16;
+		sendbufPtr[8]  = poc->PoC_joystick_map1 >> 24;
+		sendbufPtr[9]  = poc->PoC_joystick_map2 & 0xff;
+		sendbufPtr[10] = poc->PoC_joystick_map2 >> 8;
+		sendbufPtr[11] = poc->PoC_joystick_map2 >> 16;
+		sendbufPtr[12] = poc->PoC_joystick_map2 >> 24;
+		len = 13;
+		if (doJoyInputs == 2)
+		{
+			sendbufPtr[13] = poc->PoC_joystick_l_analog_X1;
+			sendbufPtr[14] = poc->PoC_joystick_l_analog_Y1;
+			sendbufPtr[15] = poc->PoC_joystick_r_analog_X1;
+			sendbufPtr[16] = poc->PoC_joystick_r_analog_Y1;
+			sendbufPtr[17] = poc->PoC_joystick_l_analog_X2;
+			sendbufPtr[18] = poc->PoC_joystick_l_analog_Y2;
+			sendbufPtr[19] = poc->PoC_joystick_r_analog_X2;
+			sendbufPtr[20] = poc->PoC_joystick_r_analog_Y2;
+			sendbufPtr[21] = poc->PoC_joystick_l_trigger1;
+			sendbufPtr[22] = poc->PoC_joystick_r_trigger1;
+			sendbufPtr[23] = poc->PoC_joystick_l_trigger2;
+			sendbufPtr[24] = poc->PoC_joystick_r_trigger2;
+			len = 25;
+		}
+	}
+	else
+	{
+		len = 9;
+		sendbufPtr[5] = poc->PoC_joystick_map1 & 0xff;
+		sendbufPtr[6] = poc->PoC_joystick_map1 >> 8;
+		sendbufPtr[7] = poc->PoC_joystick_map2 & 0xff;
+		sendbufPtr[8] = poc->PoC_joystick_map2 >> 8;
+		if (doJoyInputs == 2)
+		{
+			sendbufPtr[9]  = poc->PoC_joystick_l_analog_X1;
+			sendbufPtr[10] = poc->PoC_joystick_l_analog_Y1;
+			sendbufPtr[11] = poc->PoC_joystick_r_analog_X1;
+			sendbufPtr[12] = poc->PoC_joystick_r_analog_Y1;
+			sendbufPtr[13] = poc->PoC_joystick_l_analog_X2;
+			sendbufPtr[14] = poc->PoC_joystick_l_analog_Y2;
+			sendbufPtr[15] = poc->PoC_joystick_r_analog_X2;
+			sendbufPtr[16] = poc->PoC_joystick_r_analog_Y2;
+			len += 8;
+		}
 	}
 	poc->PoC_joystick_keep_alive = 0;
 	if (!doXDPServer)
@@ -930,6 +1084,16 @@ static void groovy_send_joysticks()
 		{
 			iph->check = inputs_ip_check_9;
 			compute_udp_checksum((unsigned short *)udph, inputs_udp_check_9);	
+		}
+		else if (len == 13)
+		{
+			iph->check = inputs_ip_check_13;
+			compute_udp_checksum((unsigned short *)udph, inputs_udp_check_13);
+		}
+		else if (len == 25)
+		{
+			iph->check = inputs_ip_check_25;
+			compute_udp_checksum((unsigned short *)udph, inputs_udp_check_25);
 		}
 		else
 		{
@@ -1138,7 +1302,16 @@ static void setInit(uint8_t compression, uint8_t audio_rate, uint8_t audio_chan,
 {
 	difMs = 0;
 	fpga_lz4_uncompressed = 0;
-	blitCompression = (compression <= 1) ? compression : 0;
+	dbgFreezeLogged = 0;   // /55: re-arm the one-shot FREEZE_LATCH log per session
+	// CMD_INIT byte[1] packs codec + NLC params: [1:0]=codec (0=raw,1=LZ4,2=NLC) [3:2]=NEAR [4]=colour(1=YCoCg)
+	// [6:5]=dispMode [7]=RICE pack (R3).
+	codecMode       = compression & 0x3;
+	nlcNear         = (compression >> 2) & 0x3;
+	nlcColor        = (compression >> 4) & 0x1;
+	nlcDispMode     = (compression >> 5) & 0x3;   // /47: NLC display mode -> FPGA init word [7:6]
+	nlcPack         = (compression >> 7) & 0x1;   // R3: entropy pack -> FPGA init word [8]
+	if (codecMode > 2) codecMode = 0;
+	blitCompression = (codecMode >= 1) ? 1 : 0;   // LZ4 AND NLC use the LZ DDR zones + compressed blit path
 	audioRate = (audio_rate <= 3) ? audio_rate : 0;
 	audioChannels = (audio_chan <= 2) ? audio_chan : 0;
 	rgbMode = (rgb_mode <= 2) ? rgb_mode : 0;
@@ -1171,9 +1344,18 @@ static void setInit(uint8_t compression, uint8_t audio_rate, uint8_t audio_chan,
   		int len = 0;
   		if (!doXDPServer)
   		{
-  			len = recvfrom(sockfdInputs, recvbuf, 1, 0, (struct sockaddr *)&clientaddrInputs, &clilen);
+			// drain ALL queued subscribe datagrams and keep the LAST one's
+			// source address: a reconnecting client (new ephemeral port) may
+			// sit behind stale subscribes from an earlier session — reading
+			// just one used to latch a dead address and stream joysticks
+			// nowhere on 2nd+ launch
+			int l;
+			while ((l = recvfrom(sockfdInputs, recvbuf, 1, 0, (struct sockaddr *)&clientaddrInputs, &clilen)) > 0)
+			{
+				len = l;
+			}
   		}
-		
+
   		if (len > 0 || isConnectedInputs)
   		{
 			getnameinfo((struct sockaddr *)&clientaddrInputs, clilen, hoststr, sizeof(hoststr), portstr, sizeof(portstr), NI_NUMERICHOST | NI_NUMERICSERV);
@@ -1260,13 +1442,13 @@ static void setBlit(uint32_t udp_frame, uint8_t udp_field, uint32_t udp_lz4_size
 	if (doVerbose > 0 && doVerbose < 3)
 	{
 		groovy_FPGA_status(0);
-		LOG(1, "[GET_STATUS][DDR fr=%d bl=%d][GPU fr=%d vc=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][AUDIO=%d][LZ4 inf=%d]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_frame, fpga_vga_vcount, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_audio, fpga_lz4_uncompressed);
+		LOG(1, "[GET_STATUS][DDR fr=%d bl=%d][GPU fr=%d vc=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][AUDIO=%d][LZ4 inf=%d][DBG %04x %04x %04x %04x]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_frame, fpga_vga_vcount, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_audio, fpga_lz4_uncompressed, fpga_dbg_live_a, fpga_dbg_live_b, fpga_dbg_frz_a, fpga_dbg_frz_b);
 	}
 
 	if (!doVerbose && !fpga_vram_synced)
  	{
  		groovy_FPGA_status(0);
- 		LOG(0, "[GET_STATUS][DDR fr=%d bl=%d][GPU fr=%d vc=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][AUDIO=%d][LZ4 inf=%d]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_frame, fpga_vga_vcount, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_audio, fpga_lz4_uncompressed);
+ 		LOG(0, "[GET_STATUS][DDR fr=%d bl=%d][GPU fr=%d vc=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][AUDIO=%d][LZ4 inf=%d][DBG %04x %04x %04x %04x]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_frame, fpga_vga_vcount, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_audio, fpga_lz4_uncompressed, fpga_dbg_live_a, fpga_dbg_live_b, fpga_dbg_frz_a, fpga_dbg_frz_b);
  	}	
  	
  	if (!poc->PoC_bytes_recv)
@@ -1306,7 +1488,7 @@ static void setBlitRaw(uint16_t len)
 	poc->PoC_bytes_recv += len;
 	isBlitting = (poc->PoC_bytes_recv >= poc->PoC_bytes_len) ? 0 : 1;
 
-       	if (!hpsBlit) //ASAP
+       	if (!hpsBlit && !recvNotifyDefer) //ASAP (mode 2 notifies once per recv batch instead)
        	{
        		numBlit++;
 		groovy_FPGA_blit(poc->PoC_bytes_recv, numBlit);
@@ -1340,11 +1522,11 @@ static void setBlitLZ4(uint16_t len)
 	poc->PoC_bytes_recv += len;
 	isBlitting = (poc->PoC_bytes_recv >= poc->PoC_bytes_lz4_len) ? 0 : 1;
 
-	if (!hpsBlit) //ASAP
+	if (!hpsBlit && !recvNotifyDefer) //ASAP (mode 2 notifies once per recv batch instead)
        	{
        		numBlit++;
 		groovy_FPGA_blit_lz4(poc->PoC_bytes_recv, numBlit);
-		LOG(2, "[ACK_BLIT][(%d) %d/%d]\n", numBlit, poc->PoC_bytes_recv, poc->PoC_bytes_lz4_len);				
+		LOG(2, "[ACK_BLIT][(%d) %d/%d]\n", numBlit, poc->PoC_bytes_recv, poc->PoC_bytes_lz4_len);
        	}
        	else
        	{
@@ -1384,6 +1566,19 @@ static void groovy_map_ddr()
 
     	isCorePriority = 0;
     	isBlitting = 0;
+
+	// /58 Phase 2 one-shot diagnostic: raw store bandwidth into the uncached window (the
+	// platform ceiling the recv modes work against). 256KB of 8-byte stores into LZ4 zone D
+	// (init-time scratch; real sessions overwrite it).
+	{
+		struct timespec bt0, bt1;
+		volatile uint64_t *bw = (volatile uint64_t *)(buffer + HEADER_OFFSET + LZ4_OFFSET_D);
+		clock_gettime(CLOCK_MONOTONIC, &bt0);
+		for (int i = 0; i < 32768; i++) bw[i] = 0xA5A5A5A5A5A5A5A5ULL;
+		clock_gettime(CLOCK_MONOTONIC, &bt1);
+		double bms = diff_in_ms(&bt0, &bt1);
+		printf("Groovy DDR window u64-store bench: 256KB in %.2f ms = %.1f MB/s\n", bms, (bms > 0.0) ? 256.0 / 1024.0 / (bms / 1000.0) : 0.0);
+	}
 }
 
 #ifdef _AF_XDP
@@ -2000,7 +2195,7 @@ static inline void process_packet(char *recvbufPtr, int len)
 
 				case CMD_INIT:
 				{
-					if (len == 4 || len == 5)
+					if (len == 4 || len == 5 || len == 6)
 					{
 						if (doVerbose)
 						{
@@ -2009,8 +2204,11 @@ static inline void process_packet(char *recvbufPtr, int len)
 						uint8_t compression = recvbufPtr[1];
 						uint8_t audio_rate = recvbufPtr[2];
 						uint8_t audio_channels = recvbufPtr[3];
-						uint8_t rgb_mode = (len == 5) ? recvbufPtr[4] : 0;
+						uint8_t rgb_mode = (len >= 5) ? recvbufPtr[4] : 0;
+						clientCaps = (len >= 6) ? (uint8_t)recvbufPtr[5] : 0;
+						if (clientCaps) LOG(1, "[CMD_INIT][caps=0x%02x]\n", clientCaps);
 						LOG(1, "[CMD_INIT][%d][LZ4=%d][Audio rate=%d chan=%d][%s][ver=%d]\n", recvbufPtr[0], compression, audio_rate, audio_channels, (rgb_mode == 1) ? "RGBA888" : (rgb_mode == 2) ? "RGB565" : "RGB888", GROOVY_VERSION);
+						LOG(1, "[RECV_MODE][%d]\n", recvMode);
 						setInit(compression, audio_rate, audio_channels, rgb_mode);
 						sendACK(0, 0);						
 					}
@@ -2100,7 +2298,7 @@ static inline void process_packet(char *recvbufPtr, int len)
 				       		setBlit(udp_frame, udp_field, udp_lz4_size, udp_frame_delta);
 				       		groovy_FPGA_status(1);
 				       		//LOG(1, "[GET_STATUS][DDR fr=%d bl=%d][GPU vc=%d fr=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][LZ4 state_1=%d inf=%d wr=%d, run=%d resume=%d t1=%d t2=%d cmd_fskip=%d stop=%d AB=%d com=%d grav=%d lleg=%d, sub=%d blit=%d]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_vcount, fpga_vga_frame, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_lz4_state, fpga_lz4_uncompressed, fpga_lz4_writed, fpga_lz4_run, fpga_lz4_resume, fpga_lz4_test1, fpga_lz4_test2, fpga_lz4_cmd_fskip, fpga_lz4_stop, fpga_lz4_ABCD, fpga_lz4_compressed, fpga_lz4_gravats, fpga_lz4_llegits, fpga_lz4_subframe_bytes, fpga_lz4_subframe_blit);
-				       		sendACK(udp_frame, udp_vsync);				       		
+				       		sendACK(udp_frame, udp_vsync);
 				       	}
 				}; break;
 
@@ -2239,6 +2437,22 @@ static inline int process_packet_eth(struct xsk_socket_info *xsk, uint64_t addr,
 
 		udp->check = 0;
 		ip->check = 0;
+		udp->len = htons(13 + sizeof(struct udphdr));
+		ip->tot_len = htons(sizeof(iphdr) + sizeof(struct udphdr) + 13);
+		update_iph_checksum(ip);
+		inputs_ip_check_13 = ip->check;
+		inputs_udp_check_13 = sum_udp_checksum(ip, udp->len);
+
+		udp->check = 0;
+		ip->check = 0;
+		udp->len = htons(25 + sizeof(struct udphdr));
+		ip->tot_len = htons(sizeof(iphdr) + sizeof(struct udphdr) + 25);
+		update_iph_checksum(ip);
+		inputs_ip_check_25 = ip->check;
+		inputs_udp_check_25 = sum_udp_checksum(ip, udp->len);
+
+		udp->check = 0;
+		ip->check = 0;
 		udp->len = htons(37 + sizeof(struct udphdr));
 		ip->tot_len = htons(sizeof(iphdr) + sizeof(struct udphdr) + 37);
 		update_iph_checksum(ip);
@@ -2366,6 +2580,41 @@ static void groovy_start()
 		// get HPS Server Settings
 		groovy_FPGA_hps();
 
+		// /58 Phase 2: ingest receive mode (env overrides the cfg file; default 1 = cached bounce)
+		{
+			const char *rm = getenv("GROOVY_RECV_MODE");
+			char rmbuf[8] = {0};
+			if (!rm)
+			{
+				FILE *rf = fopen("/media/fat/groovy_recv.cfg", "r");
+				if (rf)
+				{
+					if (fgets(rmbuf, sizeof(rmbuf), rf)) rm = rmbuf;
+					fclose(rf);
+				}
+			}
+			if (rm && rm[0] >= '0' && rm[0] <= '2') recvMode = rm[0] - '0';
+#ifndef MSG_WAITFORONE
+			if (recvMode == 2) recvMode = 1;         // no recvmmsg on this libc: degrade to bounce
+#endif
+			printf("Groovy recv mode %d\n", recvMode);
+		}
+#ifdef MSG_WAITFORONE
+		if (!recvBatchReady)
+		{
+			for (int i = 0; i < RECV_BATCH; i++)
+			{
+				recvIovs[i].iov_base           = recvBatchBuf[i];
+				recvIovs[i].iov_len            = sizeof(recvBatchBuf[i]);
+				recvMsgs[i].msg_hdr.msg_name   = &recvAddrs[i];
+				recvMsgs[i].msg_hdr.msg_namelen = sizeof(recvAddrs[i]);
+				recvMsgs[i].msg_hdr.msg_iov    = &recvIovs[i];
+				recvMsgs[i].msg_hdr.msg_iovlen = 1;
+			}
+			recvBatchReady = 1;
+		}
+#endif
+
 		// arm clock
 		if (doARMClock)
 		{
@@ -2470,6 +2719,9 @@ void groovy_stop()
 		sockfd = 0;
 		sockfdInputs = 0;		
 	}
+	// stop any active rumble when leaving Groovy so it can't linger on the pad
+	input_rumble_player(1, 0);
+	input_rumble_player(2, 0);
 	printf("Groovy-Server %d stopped\n", GROOVY_VERSION);
 	groovyServer = 0;
 }
@@ -2482,20 +2734,107 @@ void groovy_poll()
 		return;
 	}
 
+	// client->server traffic on the inputs socket, one non-blocking sweep per
+	// poll. Address-aware: len==1 is an input (re)subscribe — refresh the
+	// stored client address so the joystick/ps2 stream always follows the
+	// CURRENT client (a reconnecting client with a fresh source port used to
+	// be stuck behind the one-shot CMD_INIT read; and the old rumble-only
+	// sweep silently ATE re-subscribes without updating the address).
+	// len==4 is rumble, CAP_RUMBLE sessions only.
+	if (isConnected && (doJoyInputs || doPs2Inputs) && !doXDPServer)
+	{
+		// Caps is the only session-level gate: per-pad enable lives in the
+		// Controllers page (input.cpp groovy_get_prumble, default on) and the
+		// global kill switch is MiSTer.ini RUMBLE, both applied downstream in
+		// input_rumble_player().
+		const uint8_t rumbleOff = (clientCaps & CAP_RUMBLE) ? 0 : 1;
+		unsigned char rbuf[8];
+		int rlen;
+		struct sockaddr_in fromInputs;
+		socklen_t fromLen;
+		for (;;)
+		{
+			fromLen = sizeof(fromInputs);
+			rlen = (int) recvfrom(sockfdInputs, (char *) rbuf, sizeof(rbuf), MSG_DONTWAIT, (struct sockaddr *)&fromInputs, &fromLen);
+			if (rlen <= 0)
+			{
+				break;
+			}
+			if (rlen == 1)
+			{
+				memcpy(&clientaddrInputs, &fromInputs, sizeof(clientaddrInputs));
+				isConnectedInputs = 1;
+			}
+			else if (rlen == 4 && !rumbleOff)
+			{
+				// [0]=player(0/1) [1]=strong [2]=weak [3]=reserved
+				input_rumble_player(rbuf[0] + 1, (uint16_t)((rbuf[1] << 8) | rbuf[2]));
+				LOG(2, "[RUMBLE][%d][strong=%d weak=%d]\n", rbuf[0], rbuf[1], rbuf[2]);
+			}
+		}
+	}
+
 	do
 	{
 		if (doVerbose == 3 && isConnected && poc->PoC_bytes_len > 0)		
 		{
 			groovy_FPGA_status(0);
 			//LOG(3, "[GET_STATUS][DDR fr=%d bl=%d][GPU vc=%d fr=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][LZ4 state_1=%d inf=%d wr=%d, run=%d resume=%d t1=%d t2=%d cmd_fskip=%d stop=%d AB=%d com=%d grav=%d lleg=%d, sub=%d blit=%d]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_vcount, fpga_vga_frame, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_lz4_state, fpga_lz4_uncompressed, fpga_lz4_writed, fpga_lz4_run, fpga_lz4_resume, fpga_lz4_test1, fpga_lz4_test2, fpga_lz4_cmd_fskip, fpga_lz4_stop, fpga_lz4_ABCD, fpga_lz4_compressed, fpga_lz4_gravats, fpga_lz4_llegits, fpga_lz4_subframe_bytes, fpga_lz4_subframe_blit);
-			LOG(3, "[GET_STATUS][DDR fr=%d bl=%d][GPU fr=%d vc=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][LZ4 un=%d]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_frame, fpga_vga_vcount, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_lz4_uncompressed);
+			LOG(3, "[GET_STATUS][DDR fr=%d bl=%d][GPU fr=%d vc=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][LZ4 un=%d][DBG %04x %04x %04x %04x]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_frame, fpga_vga_vcount, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_lz4_uncompressed, fpga_dbg_live_a, fpga_dbg_live_b, fpga_dbg_frz_a, fpga_dbg_frz_b);
 		}
 
 		if (!doXDPServer)
 		{
-			char* recvbufPtr = (isBlitting) ? (char *) (buffer + HEADER_OFFSET + poc->PoC_buffer_offset + poc->PoC_bytes_recv) : (char *) &recvbuf[0];
-			int len = recvfrom(sockfd, recvbufPtr, 65536, 0, (struct sockaddr *)&clientaddr, &clilen);
-			process_packet(recvbufPtr, len);
+#ifdef MSG_WAITFORONE
+			if (recvMode == 2)
+			{
+				// /58 mode 2: drain everything queued in ONE syscall; per-message processing
+				// keeps exact legacy ordering/semantics (commands, ACKs, completion notifies
+				// run inline); the per-chunk ASAP watermark notify is deferred to ONE per batch.
+				for (int i = 0; i < RECV_BATCH; i++) recvMsgs[i].msg_hdr.msg_namelen = sizeof(recvAddrs[i]);
+				int n = recvmmsg(sockfd, recvMsgs, RECV_BATCH, MSG_WAITFORONE, NULL);
+				uint8_t gotPayload = 0;
+				recvNotifyDefer = 1;
+				for (int i = 0; i < n; i++)
+				{
+					int mlen = (int) recvMsgs[i].msg_len;
+					char *mptr = recvBatchBuf[i];
+					memcpy(&clientaddr, &recvAddrs[i], sizeof(clientaddr));   // legacy: peer refreshed per packet (ACK dest)
+					if (isBlitting && mlen > 0)
+					{
+						ddr_wide_copy((char *) (buffer + HEADER_OFFSET + poc->PoC_buffer_offset + poc->PoC_bytes_recv), mptr, mlen);
+						gotPayload = 1;
+					}
+					process_packet(mptr, mlen);
+				}
+				recvNotifyDefer = 0;
+				if (gotPayload && isBlitting == 1 && !hpsBlit)
+				{
+					// one ASAP watermark notify per batch (mid-frame only; the exact final
+					// watermark still goes out inline from setBlit*'s completion path)
+					numBlit++;
+					if (blitCompression) groovy_FPGA_blit_lz4(poc->PoC_bytes_recv, numBlit);
+					else                 groovy_FPGA_blit(poc->PoC_bytes_recv, numBlit);
+				}
+			}
+			else
+#endif
+			if (recvMode == 1 && isBlitting)
+			{
+				// /58 mode 1: cached bounce + wide-store copy (protocol-identical to mode 0 —
+				// same per-chunk notifies; only the payload's route into the window changes)
+				int len = recvfrom(sockfd, (char *) &recvbuf[0], 65536, 0, (struct sockaddr *)&clientaddr, &clilen);
+				if (len > 0)
+					ddr_wide_copy((char *) (buffer + HEADER_OFFSET + poc->PoC_buffer_offset + poc->PoC_bytes_recv), (char *) &recvbuf[0], len);
+				process_packet((char *) &recvbuf[0], len);
+			}
+			else
+			{
+				// mode 0 / idle: the legacy path (commands always land in recvbuf)
+				char* recvbufPtr = (isBlitting) ? (char *) (buffer + HEADER_OFFSET + poc->PoC_buffer_offset + poc->PoC_bytes_recv) : (char *) &recvbuf[0];
+				int len = recvfrom(sockfd, recvbufPtr, 65536, 0, (struct sockaddr *)&clientaddr, &clilen);
+				process_packet(recvbufPtr, len);
+			}
 		}
 #ifdef _AF_XDP
 		else
@@ -2579,6 +2918,31 @@ void groovy_send_analog(unsigned char joystick, unsigned char analog, char value
 	else
 	{
 		LOG(2, "[JOY_%s][%d][x=%d,y=%d]\n", (analog) ? "R" : "L", joystick, valueX, valueY);
+	}
+}
+
+void groovy_send_trigger(unsigned char joystick, unsigned char right, unsigned char value)
+{
+	poc->PoC_joystick_order++;
+	if (joystick == 0)
+	{
+		if (right) poc->PoC_joystick_r_trigger1 = value;
+		else       poc->PoC_joystick_l_trigger1 = value;
+	}
+	if (joystick == 1)
+	{
+		if (right) poc->PoC_joystick_r_trigger2 = value;
+		else       poc->PoC_joystick_l_trigger2 = value;
+	}
+
+	if (isConnectedInputs && doJoyInputs == 2 && (clientCaps & CAP_INPUTS_V2))
+	{
+		groovy_send_joysticks();
+		LOG(2, "[JOY_T%s_ACK][%d][v=%d]\n", (right) ? "R" : "L", joystick, value);
+	}
+	else
+	{
+		LOG(2, "[JOY_T%s][%d][v=%d]\n", (right) ? "R" : "L", joystick, value);
 	}
 }
 

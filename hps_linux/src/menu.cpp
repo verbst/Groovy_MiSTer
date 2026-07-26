@@ -76,6 +76,16 @@ enum MENU
 	MENU_SYSTEM2,
 	MENU_COMMON1,
 	MENU_COMMON2,
+	MENU_GROOVY1,
+	MENU_GROOVY2,
+	MENU_GROOVYDEV1,
+	MENU_GROOVYDEV2,
+	MENU_GROOVYNICK1,
+	MENU_GROOVYNICK2,
+	MENU_GROOVYBTNS1,
+	MENU_GROOVYBTNS2,
+	MENU_GROOVYCAP1,
+	MENU_GROOVYCAP2,
 	MENU_MISC1,
 	MENU_MISC2,
 
@@ -440,6 +450,104 @@ void SelectFile(const char* path, const char* pFileExt, int Options, unsigned ch
 #define STD_BACK       "            back"
 #define STD_SPACE_EXIT "        SPACE to exit"
 #define STD_COMBO_EXIT "      Ctrl+ESC to exit"
+
+// ---- groovy Controllers page (fork) ---------------------------------------------------
+// accessors implemented in input.cpp
+int  groovy_player_dev(int player);
+char *groovy_get_nick(int dev);
+char groovy_get_ctype(int dev);
+int  groovy_get_profile(int dev);
+void groovy_set_profile(int dev, int profile);
+void groovy_set_ctype(int dev, char t);
+void groovy_set_nick(int dev, const char *nick);
+char *groovy_dev_name(int dev);
+int  get_map_dev();
+char *groovy_get_pname(int dev, int prof);
+void groovy_set_pname(int dev, int prof, const char *name);
+int  groovy_read_map(int dev, uint32_t *out);
+int  groovy_get_prumble(int dev, int prof);
+void groovy_set_prumble(int dev, int prof, int v);
+void groovy_stop_rumble_dev(int dev);
+int  groovy_get_pinvy(int dev, int prof);
+void groovy_set_pinvy(int dev, int prof, int v);
+void groovy_capture_begin(int dev, int pos);
+int  groovy_capture_done(void);
+void groovy_capture_cancel(void);
+
+static int gctrl_dev = 0;              // device slot shown on the detail page
+static int gctrl_player = 1;           // 1-based player shown on the detail page
+static char gctrl_nick[17] = {};       // name-editor buffer
+static int gctrl_pos = 0;              // name-editor cursor
+static unsigned long gctrl_timer = 0;  // list live-refresh timer
+static const char gctrl_chars[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#-_";
+
+// per-type OSD label sets; positions are fixed (pos 1 = Cross = Xbox A) and the
+// wire always carries anonymous Button 1..12 (bits 4..15)
+static const char *gctrl_lbl_ds[12]   = { "Cross", "Circle", "Square", "Triangle", "L1", "R1", "Select", "Start", "L2", "R2", "L3", "R3" };
+static const char *gctrl_lbl_xbox[12] = { "A", "B", "X", "Y", "LB", "RB", "Back", "Start", "LT", "RT", "LS", "RS" };
+static char gctrl_edit_mode = 0;       // name editor target: 0 = nickname, 1 = profile name
+static char gctrl_define_return = 0;   // set when Define is launched from the Controllers page
+static int  gctrl_cap_slot = 0;        // pad position (0-11) being single-remapped
+
+static const char *gctrl_pos_label(char ctype, int pos)
+{
+	static char num[2][12];
+	static int flip = 0;
+	if (ctype == 'D') return gctrl_lbl_ds[pos];
+	if (ctype == 'X') return gctrl_lbl_xbox[pos];
+	flip ^= 1;
+	sprintf(num[flip], "Button %d", pos + 1);
+	return num[flip];
+}
+
+static void gctrl_apply_labels(char ctype)
+{
+	joy_bcount = 12;
+	for (int i = 0; i < 12; i++) strcpy(joy_bnames[i], gctrl_pos_label(ctype, i));
+}
+
+// short position label for the assignment list (generic types shrink to fit 2 cols)
+static const char *gctrl_pos_label_short(char ctype, int pos)
+{
+	static char num[2][8];
+	static int sflip = 0;
+	if (ctype == 'D') return gctrl_lbl_ds[pos];
+	if (ctype == 'X') return gctrl_lbl_xbox[pos];
+	sflip ^= 1;
+	sprintf(num[sflip], "Btn %d", pos + 1);
+	return num[sflip];
+}
+
+// compact physical-button token for the assignment list ("--" = unassigned)
+static void gctrl_btn_tok(char ctype, uint32_t mapcode, char *out)
+{
+	uint16_t code = (uint16_t)(mapcode & 0xFFFF);
+	if (!code) { strcpy(out, "--"); return; }
+	// standard Linux gamepad button -> canonical pad position (0-11); SDL/kernel convention
+	int idx = -1;
+	switch (code)
+	{
+		case 0x130: idx = 0; break;  // BTN_SOUTH  Cross / A
+		case 0x131: idx = 1; break;  // BTN_EAST   Circle / B
+		case 0x134: idx = 2; break;  // BTN_WEST   Square / X
+		case 0x133: idx = 3; break;  // BTN_NORTH  Triangle / Y
+		case 0x136: idx = 4; break;  // BTN_TL     L1 / LB
+		case 0x137: idx = 5; break;  // BTN_TR     R1 / RB
+		case 0x13a: idx = 6; break;  // BTN_SELECT Select / Back
+		case 0x13b: idx = 7; break;  // BTN_START  Start
+		case 0x138: idx = 8; break;  // BTN_TL2    L2 / LT
+		case 0x139: idx = 9; break;  // BTN_TR2    R2 / RT
+		case 0x13d: idx = 10; break; // BTN_THUMBL L3 / LS
+		case 0x13e: idx = 11; break; // BTN_THUMBR R3 / RS
+	}
+	// speak the controller's language for known gamepad buttons; else a plain number
+	if (idx >= 0 && (ctype == 'D' || ctype == 'X')) snprintf(out, 8, "%s", gctrl_pos_label_short(ctype, idx));
+	else if (code >= 0x130 && code <= 0x13f) sprintf(out, "b%d", code - 0x12F);
+	else if (code >= 0x120 && code <= 0x12f) sprintf(out, "b%d", code - 0x11F);
+	else if (code >= 0x100 && code <= 0x11f) sprintf(out, "b%d", code - 0xFF);
+	else if (code < 256) strcpy(out, "KEY");
+	else sprintf(out, "%03x", code & 0xFFF);
+}
 
 // conversion table of Amiga keyboard scan codes to ASCII codes
 static const uint8_t keycode_table[128] =
@@ -2522,8 +2630,369 @@ void HandleUI(void)
 		}
 		break;
 
+	case MENU_GROOVY1:
+		{
+			OsdSetSize(16);
+			helptext_idx = 0;
+			OsdSetTitle("Controllers", 0);
+			menustate = MENU_GROOVY2;
+			parentstate = MENU_GROOVY1;
+			gctrl_timer = GetTimer(500);
+			int n = 0;
+			menumask = 0x300; // Reassign(8) + Exit(9); player/profile rows added below
+			for (int p = 1; p <= 4; p++)
+			{
+				int dev = groovy_player_dev(p);
+				if (dev >= 0)
+				{
+					int prof = groovy_get_profile(dev);
+					menumask |= 3 << ((p - 1) * 2);
+					sprintf(s, " PLAYER%d = %-16s", p, groovy_get_nick(dev));
+					s[27] = '\x16';
+					s[28] = 0;
+					MenuWrite(n++, s, menusub == (uint32_t)((p - 1) * 2), 0);
+					sprintf(s, "   profile %d: %s", prof, groovy_get_pname(dev, prof));
+					MenuWrite(n++, s, menusub == (uint32_t)((p - 1) * 2 + 1), 0);
+				}
+				else
+				{
+					sprintf(s, " PLAYER%d = - none -", p);
+					MenuWrite(n++, s, 0, 1);
+					MenuWrite(n++);
+				}
+			}
+			MenuWrite(n++);
+			MenuWrite(n++, " Reassign players", menusub == 8, 0);
+			MenuWrite(n++);
+			MenuWrite(n++, " left/right on profile rows", 0, 1);
+			MenuWrite(n++, " switches profiles fast.", 0, 1);
+			while (n < OsdGetSize() - 1) MenuWrite(n++);
+			MenuWrite(n++, STD_EXIT, menusub == 9, 0, OSD_ARROW_LEFT);
+		}
+		break;
+
+	case MENU_GROOVY2:
+		if (menu)
+		{
+			menustate = MENU_COMMON1;
+			menusub = 7;
+			break;
+		}
+		if (select || left || right)
+		{
+			if (menusub <= 7)
+			{
+				int p = (int)(menusub / 2) + 1;
+				int dev = groovy_player_dev(p);
+				if (dev >= 0)
+				{
+					if (menusub & 1)
+					{
+						int prof = groovy_get_profile(dev);
+						groovy_set_profile(dev, left ? (prof ? prof - 1 : 9) : ((prof < 9) ? prof + 1 : 0));
+						menustate = MENU_GROOVY1;
+					}
+					else if (select)
+					{
+						gctrl_dev = dev;
+						gctrl_player = p;
+						menustate = MENU_GROOVYDEV1;
+						menusub = 0;
+					}
+				}
+			}
+			else if (menusub == 8)
+			{
+				if (select)
+				{
+					reset_players();
+					menustate = MENU_GROOVY1;
+				}
+			}
+			else if (select)
+			{
+				menustate = MENU_NONE1;
+			}
+			break;
+		}
+		if (CheckTimer(gctrl_timer)) menustate = MENU_GROOVY1;
+		break;
+
+	case MENU_GROOVYDEV1:
+		{
+			helptext_idx = 0;
+			sprintf(s, "Player %d", gctrl_player);
+			OsdSetTitle(s, 0);
+			menustate = MENU_GROOVYDEV2;
+			parentstate = MENU_GROOVYDEV1;
+			gctrl_timer = GetTimer(500);
+			menumask = 0x1FF; // 0-7 settings + Exit(8)
+			char ct = groovy_get_ctype(gctrl_dev);
+			int prof = groovy_get_profile(gctrl_dev);
+			int n = 0;
+			sprintf(s, " Name:    %s", groovy_get_nick(gctrl_dev));
+			MenuWrite(n++, s, menusub == 0, 0);
+			sprintf(s, " Type:    %s", (ct == 'A') ? "Arcade stick" : (ct == 'D') ? "DualShock" : (ct == 'X') ? "Xbox pad" : "Gamepad");
+			MenuWrite(n++, s, menusub == 1, 0);
+			sprintf(s, " Profile: %d <%s>", prof, groovy_get_pname(gctrl_dev, prof));
+			MenuWrite(n++, s, menusub == 2, 0);
+			MenuWrite(n++, " Rename profile...", menusub == 3, 0);
+			sprintf(s, " Rumble:  %s", groovy_get_prumble(gctrl_dev, prof) ? "On" : "Off");
+			MenuWrite(n++, s, menusub == 4, 0);
+			sprintf(s, " Invert stick Y: %s", groovy_get_pinvy(gctrl_dev, prof) ? "On" : "Off");
+			MenuWrite(n++, s, menusub == 5, 0);
+			MenuWrite(n++, " Button assignments...", menusub == 6, 0);
+			sprintf(s, " Define all (profile %d)", prof);
+			MenuWrite(n++, s, menusub == 7, 0);
+			MenuWrite(n++);
+			{
+				char dn[80];
+				snprintf(dn, sizeof(dn), "%s", groovy_dev_name(gctrl_dev));
+				sprintf(s, " Device: %-19.19s", dn);
+				MenuWrite(n++, s, 0, 1);
+				if (strlen(dn) > 19)
+				{
+					sprintf(s, "         %.19s", dn + 19);
+					MenuWrite(n++, s, 0, 1);
+				}
+			}
+			while (n < OsdGetSize() - 1) MenuWrite(n++);
+			MenuWrite(n++, STD_EXIT, menusub == 8, 0, OSD_ARROW_LEFT);
+		}
+		break;
+
+	case MENU_GROOVYDEV2:
+		if (menu)
+		{
+			menustate = MENU_GROOVY1;
+			menusub = (gctrl_player - 1) * 2;
+			break;
+		}
+		if (select && menusub == 0)
+		{
+			gctrl_edit_mode = 0;
+			snprintf(gctrl_nick, sizeof(gctrl_nick), "%s", groovy_get_nick(gctrl_dev));
+			gctrl_pos = strlen(gctrl_nick);
+			if (gctrl_pos > 15) gctrl_pos = 15;
+			menustate = MENU_GROOVYNICK1;
+			break;
+		}
+		if ((select || left || right) && menusub == 1)
+		{
+			char ct = groovy_get_ctype(gctrl_dev);
+			groovy_set_ctype(gctrl_dev, left ? ((ct == 'A') ? 'P' : (ct == 'D') ? 'A' : (ct == 'X') ? 'D' : 'X') : ((ct == 'A') ? 'D' : (ct == 'D') ? 'X' : (ct == 'X') ? 'P' : 'A'));
+			menustate = MENU_GROOVYDEV1;
+			break;
+		}
+		if ((select || left || right) && menusub == 2)
+		{
+			int p = groovy_get_profile(gctrl_dev);
+			groovy_set_profile(gctrl_dev, left ? (p ? p - 1 : 9) : ((p < 9) ? p + 1 : 0));
+			menustate = MENU_GROOVYDEV1;
+			break;
+		}
+		if (select && menusub == 3)
+		{
+			gctrl_edit_mode = 1;
+			snprintf(gctrl_nick, sizeof(gctrl_nick), "%s", groovy_get_pname(gctrl_dev, groovy_get_profile(gctrl_dev)));
+			gctrl_pos = strlen(gctrl_nick);
+			if (gctrl_pos > 15) gctrl_pos = 15;
+			menustate = MENU_GROOVYNICK1;
+			break;
+		}
+		if ((select || left || right) && menusub == 4)
+		{
+			int prof = groovy_get_profile(gctrl_dev);
+			int v = !groovy_get_prumble(gctrl_dev, prof);
+			groovy_set_prumble(gctrl_dev, prof, v);
+			if (!v) groovy_stop_rumble_dev(gctrl_dev); // silence a buzz already running
+			menustate = MENU_GROOVYDEV1;
+			break;
+		}
+		if ((select || left || right) && menusub == 5)
+		{
+			int prof = groovy_get_profile(gctrl_dev);
+			groovy_set_pinvy(gctrl_dev, prof, !groovy_get_pinvy(gctrl_dev, prof));
+			menustate = MENU_GROOVYDEV1;
+			break;
+		}
+		if (select && menusub == 6)
+		{
+			menustate = MENU_GROOVYBTNS1;
+			menusub = 0;
+			break;
+		}
+		if (select && menusub == 7)
+		{
+			gctrl_apply_labels(groovy_get_ctype(gctrl_dev));
+			gctrl_define_return = 1;
+			start_map_setting(joy_bcount ? joy_bcount + 4 : 8);
+			menustate = MENU_JOYDIGMAP;
+			menusub = 0;
+			joymap_first = 1;
+			break;
+		}
+		if (select && menusub == 8)
+		{
+			menustate = MENU_NONE1;
+			break;
+		}
+		if (CheckTimer(gctrl_timer)) menustate = MENU_GROOVYDEV1;
+		break;
+
+	case MENU_GROOVYBTNS1:
+		{
+			helptext_idx = 0;
+			sprintf(s, "Buttons P%d", gctrl_player);
+			OsdSetTitle(s, 0);
+			menustate = MENU_GROOVYBTNS2;
+			parentstate = MENU_GROOVYBTNS1;
+			gctrl_timer = GetTimer(500);
+			menumask = 0x1FFF; // 12 buttons (0-11) + Exit(12)
+			char ct = groovy_get_ctype(gctrl_dev);
+			int prof = groovy_get_profile(gctrl_dev);
+			uint32_t gmap[32];
+			int have = groovy_read_map(gctrl_dev, gmap);
+			int n = 0;
+			for (int b = 0; b < 12; b++)
+			{
+				char tok[8];
+				gctrl_btn_tok(ct, have ? gmap[4 + b] : 0, tok);
+				sprintf(s, " Button %-2d = %-6.6s", b + 1, tok);
+				MenuWrite(n++, s, menusub == (uint32_t)b, 0);
+			}
+			MenuWrite(n++);
+			sprintf(s, " Sticks: L+R  Y-inv:%s", groovy_get_pinvy(gctrl_dev, prof) ? "On" : "Off");
+			MenuWrite(n++, s, 0, 1);
+			MenuWrite(n++, " Enter \x16 remap a button", 0, 1);
+			while (n < OsdGetSize() - 1) MenuWrite(n++);
+			MenuWrite(n++, STD_EXIT, menusub == 12, 0, OSD_ARROW_LEFT);
+		}
+		break;
+
+	case MENU_GROOVYBTNS2:
+		if (menu)
+		{
+			menustate = MENU_GROOVYDEV1;
+			menusub = 6;
+			break;
+		}
+		if (select)
+		{
+			if (menusub <= 11)
+			{
+				gctrl_cap_slot = menusub;
+				groovy_capture_begin(gctrl_dev, 4 + menusub);
+				menustate = MENU_GROOVYCAP1;
+			}
+			else
+			{
+				menustate = MENU_GROOVYDEV1;
+				menusub = 6;
+			}
+			break;
+		}
+		if (CheckTimer(gctrl_timer)) menustate = MENU_GROOVYBTNS1;
+		break;
+
+	case MENU_GROOVYCAP1:
+		{
+			OsdSetTitle("Remap", 0);
+			menustate = MENU_GROOVYCAP2;
+			parentstate = MENU_GROOVYCAP1;
+			menumask = 0;
+			for (int i = 0; i < OsdGetSize(); i++) OsdWrite(i);
+			OsdWrite(5, "     Press a button for");
+			sprintf(s, "          Button %d", gctrl_cap_slot + 1);
+			OsdWrite(7, s);
+			OsdWrite(11, "        Esc \x16 Cancel");
+		}
+		break;
+
+	case MENU_GROOVYCAP2:
+		if (groovy_capture_done())
+		{
+			menustate = MENU_GROOVYBTNS1;
+			break;
+		}
+		if (menu)
+		{
+			groovy_capture_cancel();
+			menustate = MENU_GROOVYBTNS1;
+			break;
+		}
+		break;
+
+	case MENU_GROOVYNICK1:
+		{
+			OsdSetTitle(gctrl_edit_mode ? "Profile name" : "Edit name", 0);
+			menustate = MENU_GROOVYNICK2;
+			parentstate = MENU_GROOVYNICK1;
+			menumask = 0;
+			for (int i = 0; i < OsdGetSize(); i++) OsdWrite(i);
+			OsdWrite(3, gctrl_edit_mode ? "      Profile name:" : "      Controller name:");
+			sprintf(s, "      [%-16s]", gctrl_nick);
+			OsdWrite(5, s);
+			memset(s, ' ', 24);
+			s[7 + gctrl_pos] = '^';
+			s[8 + gctrl_pos] = 0;
+			OsdWrite(6, s);
+			OsdWrite(9,  "  left/right: move cursor");
+			OsdWrite(10, "  up/down:    change letter");
+			OsdWrite(12, "  OK: save    Back: cancel");
+		}
+		break;
+
+	case MENU_GROOVYNICK2:
+		if (menu)
+		{
+			menustate = MENU_GROOVYDEV1;
+			menusub = gctrl_edit_mode ? 3 : 0;
+			break;
+		}
+		if (select)
+		{
+			int l = strlen(gctrl_nick);
+			while (l > 0 && gctrl_nick[l - 1] == ' ') gctrl_nick[--l] = 0;
+			if (gctrl_edit_mode) groovy_set_pname(gctrl_dev, groovy_get_profile(gctrl_dev), gctrl_nick);
+			else groovy_set_nick(gctrl_dev, gctrl_nick);
+			menustate = MENU_GROOVYDEV1;
+			menusub = gctrl_edit_mode ? 3 : 0;
+			break;
+		}
+		if (left && gctrl_pos > 0)
+		{
+			gctrl_pos--;
+			menustate = MENU_GROOVYNICK1;
+		}
+		if (right && gctrl_pos < 15)
+		{
+			gctrl_pos++;
+			menustate = MENU_GROOVYNICK1;
+		}
+		if (up || down)
+		{
+			int l = (int)strlen(gctrl_nick);
+			while (l <= gctrl_pos) { gctrl_nick[l] = ' '; gctrl_nick[++l] = 0; }
+			const int nch = (int)sizeof(gctrl_chars) - 1;
+			const char *f = strchr(gctrl_chars, gctrl_nick[gctrl_pos]);
+			int ci = f ? (int)(f - gctrl_chars) : 0;
+			ci = (ci + (up ? 1 : nch - 1)) % nch;
+			gctrl_nick[gctrl_pos] = gctrl_chars[ci];
+			menustate = MENU_GROOVYNICK1;
+		}
+		break;
+
 	case MENU_COMMON1:
 		{
+			if (gctrl_define_return)
+			{
+				// return to the Controllers detail page after a define launched from it
+				gctrl_define_return = 0;
+				menustate = MENU_GROOVYDEV1;
+				menusub = 7;
+				break;
+			}
 			OsdSetSize(16);
 			helptext_idx = 0;
 			reboot_req = 0;
@@ -2557,6 +3026,15 @@ void HandleUI(void)
 				MenuWrite(n++, s, menusub == 2, 0);
 				MenuWrite(n++, " Button/Key remap          \x16", menusub == 3, 0);
 				MenuWrite(n++, " Reset player assignment", menusub == 4, 0);
+				{
+					// diagnostic: if the Controllers item is ever missing, the log says why
+					static char gctrl_dbg = 0;
+					if (!gctrl_dbg)
+					{
+						gctrl_dbg = 1;
+						printf("Groovy OSD: Controllers item %s\n", is_groovy() ? "shown" : "HIDDEN (is_groovy false)");
+					}
+				}
 
 				if (user_io_get_uart_mode())
 				{
@@ -2573,6 +3051,12 @@ void HandleUI(void)
 
 				MenuWrite(n++);
 				MenuWrite(n++, " Video processing          \x16", menusub==6);
+				if (is_groovy())
+				{
+					// index 7 must follow index 6 visually so up/down order matches the screen
+					menumask |= 0x80;
+					MenuWrite(n++, " Controllers               \x16", menusub == 7, 0);
+				}
 
 				if (audio_filter_en() >= 0)
 				{
@@ -2689,6 +3173,11 @@ void HandleUI(void)
 			case 4:
 				reset_players();
 				menustate = MENU_NONE1;
+				break;
+
+			case 7:
+				menustate = MENU_GROOVY1;
+				menusub = 0;
 				break;
 
 			case 5:
@@ -3833,6 +4322,12 @@ void HandleUI(void)
 			}
 
 			if (is_menu() && !get_map_button()) OsdWrite(7);
+
+			// groovy: switch prompt labels to the mapped device's type once it's known
+			if (is_groovy() && !is_menu() && get_map_type() == 1 && get_map_dev() >= 0)
+			{
+				gctrl_apply_labels(groovy_get_ctype(get_map_dev()));
+			}
 
 			const char* p = 0;
 			if (get_map_button() < 0)

@@ -1592,6 +1592,14 @@ void user_io_init(const char *path, const char *xml)
 				}
 			}
 
+			if (is_groovy())
+			{
+				// extend the RBF's 10 generic buttons to the full 12 (bits 4..15). Display
+				// labels stay generic; the OSD swaps in type-specific names per device
+				// (gctrl_apply_labels in menu.cpp). jn gives known pads positional auto-derive.
+				set_ovr_buttons((char*)"Button 1,Button 2,Button 3,Button 4,Button 5,Button 6,Button 7,Button 8,Button 9,Button 10,Button 11,Button 12", 0);
+				set_ovr_buttons((char*)"B,A,Y,X,L,R,Select,Start", 1);
+			}
 			parse_buttons();
 		}
 
@@ -1713,6 +1721,15 @@ void user_io_r_analog_joystick(unsigned char joystick, char valueX, char valueY)
 	if (is_groovy())
 	{
 		groovy_send_analog(joystick, 1, valueX, valueY);
+	}
+}
+
+void user_io_analog_trigger(unsigned char joystick, unsigned char right, unsigned char value)
+{
+	// analog triggers exist only on the groovy UDP path; the FPGA has no trigger transport
+	if (is_groovy())
+	{
+		groovy_send_trigger(joystick, right, value);
 	}
 }
 

@@ -3,9 +3,16 @@
 using std::cout;
 using std::endl;
 
-//mingw missing headers
-//#if defined(_WIN32) && !defined(WSA_FLAG_REGISTERED_IO)
-#if defined(_WIN32)
+// Registered-IO surface for toolchains whose headers lack it (mingw-w64).
+// Keyed on RIO_INVALID_CQ: it ships in the SAME SDK block (mswsockdef.h,
+// NTDDI >= WIN8) as the RIO types themselves, so it is present exactly when
+// this block must be skipped (MSVC: defining it here collides with the SDK's
+// non-identical types, C2371/C2011) and absent exactly when it must be active
+// (mingw-w64 defines NO RIO types anywhere). Do NOT key on
+// WSA_FLAG_REGISTERED_IO — BOTH toolchains define that flag (mingw
+// winsock2.h:526), it says nothing about the types; that key skipped the
+// block on mingw and broke the build, which is why it was once commented out.
+#if defined(_WIN32) && !defined(RIO_INVALID_CQ)
 #define WSA_FLAG_REGISTERED_IO 0x100
 #define SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER _WSAIORW(IOC_WS2, 36)
 #define WSAID_MULTIPLE_RIO {0x8509e081, 0x96dd, 0x4005, { 0xb1, 0x65, 0x9e, 0x2e, 0xe8, 0xc7, 0x9e, 0x3f } }

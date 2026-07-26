@@ -206,6 +206,7 @@ int user_io_get_joy_transl();
 void user_io_digital_joystick(unsigned char, uint64_t, int);
 void user_io_l_analog_joystick(unsigned char, char, char);
 void user_io_r_analog_joystick(unsigned char, char, char);
+void user_io_analog_trigger(unsigned char, unsigned char, unsigned char);
 void user_io_set_joyswap(int swap);
 int user_io_get_joyswap();
 char user_io_osd_is_visible();

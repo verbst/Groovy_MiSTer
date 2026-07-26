@@ -64,6 +64,34 @@ extern "C" {
 #define GMW_JOY_B8    (1 << 11)
 #define GMW_JOY_B9    (1 << 12)
 #define GMW_JOY_B10   (1 << 13)
+#define GMW_JOY_B11   (1 << 14)
+#define GMW_JOY_B12   (1 << 15)
+
+/* The wire is GENERIC: bits 4..15 are Button 1..12 (GMW_JOY_B1..B12). The
+   aliases below are the DualShock-type LABELING CONVENTION for those positions
+   (the MiSTer OSD shows per-controller-type labels; equivalent positions line
+   up across types, e.g. pos 1 = Cross = Xbox A). Per-device .map files on the
+   MiSTer translate physical buttons to positions. Bits 12-15 (L2/R2/L3/R3)
+   arrive even on the old 16-bit joystick packet. */
+#define GMW_JOY_CROSS    GMW_JOY_B1
+#define GMW_JOY_CIRCLE   GMW_JOY_B2
+#define GMW_JOY_SQUARE   GMW_JOY_B3
+#define GMW_JOY_TRIANGLE GMW_JOY_B4
+#define GMW_JOY_L1       GMW_JOY_B5
+#define GMW_JOY_R1       GMW_JOY_B6
+#define GMW_JOY_SELECT   GMW_JOY_B7
+#define GMW_JOY_START    GMW_JOY_B8
+#define GMW_JOY_L2       GMW_JOY_B9
+#define GMW_JOY_R2       GMW_JOY_B10
+#define GMW_JOY_L3       GMW_JOY_B11
+#define GMW_JOY_R3       GMW_JOY_B12
+
+/* CMD_INIT byte[5] capability flags for gmw_set_input_caps. The client
+   negotiates them internally (CMD_GET_VERSION probe before CMD_INIT), so
+   requesting caps against a pre-v2 core simply lands on a v1 session —
+   check gmw_get_input_caps() for what was actually granted. */
+#define GMW_CAP_INPUTS_V2 0x01 /* joystick packets v2: 32-bit masks + analog triggers */
+#define GMW_CAP_RUMBLE    0x02 /* client may send rumble messages on the inputs socket */
 
 /* FPGA data received on ACK */
 typedef struct MODULE_API_GMW
@@ -83,11 +111,13 @@ typedef struct MODULE_API_GMW
 	uint8_t vramQueue; 	//1-fpga has pixels prepared on vram
 } gmw_fpgaStatus;
 
+/* NOTE (inputs v2): joy1/joy2 widened uint16_t -> uint32_t and the four
+   trigger fields appended — struct layout changed, RECOMPILE consumers. */
 typedef struct MODULE_API_GMW{
 	uint32_t joyFrame;	//joystick blit frame
 	uint8_t  joyOrder;	//joystick blit order
-	uint16_t joy1;	 	//joystick 1 map
-	uint16_t joy2;	 	//joystick 2 map
+	uint32_t joy1;	 	//joystick 1 map (v2: 32-bit; v1 cores fill the low 16 bits)
+	uint32_t joy2;	 	//joystick 2 map
 	char     joy1LXAnalog; 	//joystick 1 L-Analog X
 	char     joy1LYAnalog; 	//joystick 1 L-Analog Y
 	char     joy1RXAnalog; 	//joystick 1 R-Analog X
@@ -96,6 +126,10 @@ typedef struct MODULE_API_GMW{
 	char     joy2LYAnalog; 	//joystick 2 L-Analog Y
 	char     joy2RXAnalog; 	//joystick 2 R-Analog X
 	char     joy2RYAnalog; 	//joystick 2 R-Analog Y
+	uint8_t  joy1LTAnalog; 	//joystick 1 L-Trigger 0..255 (v2 analog packet only)
+	uint8_t  joy1RTAnalog; 	//joystick 1 R-Trigger
+	uint8_t  joy2LTAnalog; 	//joystick 2 L-Trigger
+	uint8_t  joy2RTAnalog; 	//joystick 2 R-Trigger
 } gmw_fpgaJoyInputs;
 
 typedef struct MODULE_API_GMW{
@@ -115,7 +149,10 @@ enum Lz4FramesCode { //gmw_init lz4Frames
     LZ4_HC = 3,
     LZ4_HC_DELTA = 4,
     LZ4_ADPTATIVE = 5,
-    LZ4_ADPTATIVE_DELTA = 6
+    LZ4_ADPTATIVE_DELTA = 6,
+    // NLC near-lossless codec. The entropy front-end (TILED / RICE) is a separate
+    // knob — see gmw_set_nlc_pack; also tune via gmw_set_near_level.
+    NLC = 7
 };
 
 enum SoundRateCode { //gmw_init soundRate
@@ -144,6 +181,17 @@ enum RGBModeCode { //gmw_init rgbMode
 MODULE_API_GMW int gmw_init(const char* misterHost, uint8_t lz4Frames, uint32_t soundRate, uint8_t soundChan, uint8_t rgbMode, uint16_t mtu);
 // Close stream
 MODULE_API_GMW void gmw_close(void);
+// Send only the CMD_CLOSE datagram (no socket teardown). For shutdown paths on
+// threads that no longer drain the RIO queues. Safe to call repeatedly and
+// before gmw_close.
+MODULE_API_GMW void gmw_send_close(void);
+// 1 if the shared connection (from gmw_init) is live. Pad code should check
+// this before touching the input socket so it never creates a second client.
+MODULE_API_GMW uint8_t gmw_is_connected(void);
+// Monotonic auto-reconnect counter (see gmw_set_auto_reconnect). The client
+// replays the stashed modeline itself after a reconnect; hosts that keep their
+// own modeline state can watch this to know a reconnect happened.
+MODULE_API_GMW uint32_t gmw_reconnect_epoch(void);
 // Change resolution (check https://github.com/antonioginer/switchres) for modeline generation (interlace=2 for progressive framebuffer)
 MODULE_API_GMW void gmw_switchres(double pClock, uint16_t hActive, uint16_t hBegin, uint16_t hEnd, uint16_t hTotal, uint16_t vActive, uint16_t vBegin, uint16_t vEnd, uint16_t vTotal, uint8_t interlace);
 // This buffer are registered and aligned for sending rgb. Populate it before gmw_blit
@@ -168,6 +216,26 @@ MODULE_API_GMW void gmw_getStatus(gmw_fpgaStatus* status);
 MODULE_API_GMW void gmw_bindInputs(const char* misterHost);
 // refresh inputs
 MODULE_API_GMW void gmw_pollInputs(void);
+// Re-send the 1-byte input subscribe on the existing socket (UDP-loss
+// insurance for threaded clients). Only meaningful after gmw_bindInputs.
+MODULE_API_GMW void gmw_resubscribe_inputs(void);
+// GMW_CAP_* capability flags, requested for the next gmw_init. Call BEFORE
+// gmw_init (creates the client object if needed, so ordering vs gmw_bindInputs
+// does not matter). 0 = legacy v1, byte-identical 5-byte init. The client
+// probes the core version and drops to v1 automatically when the core cannot
+// take the caps byte; the value persists across internal auto-reconnects.
+MODULE_API_GMW void gmw_set_input_caps(uint8_t caps);
+// Caps actually NEGOTIATED for the live session (0 when not connected or when
+// the probe landed on v1). Gate rumble/trigger handling on this, not on what
+// was requested.
+MODULE_API_GMW uint8_t gmw_get_input_caps(void);
+// Rumble player 0/1's pad (strong/weak motor 0..255). Requires GMW_CAP_RUMBLE
+// negotiated; the MiSTer gates it per pad in OSD -> System -> Controllers ->
+// <player> -> Rumble (default On), and force-stops motors on session
+// close. Send on STATE CHANGE only — the core repeats the last value until
+// replaced (0/0 stops). Internally guarded: no-op when not connected, inputs
+// not bound, or rumble not negotiated.
+MODULE_API_GMW void gmw_send_rumble(uint8_t player, uint8_t strong, uint8_t weak);
 // get joystick inputs
 MODULE_API_GMW void gmw_getJoyInputs(gmw_fpgaJoyInputs* joyInputs);
 // get ps2 inputs
@@ -177,6 +245,37 @@ MODULE_API_GMW void gmw_getPS2Inputs(gmw_fpgaPS2Inputs* ps2Inputs);
 MODULE_API_GMW const char* gmw_get_version(void);
 // Verbose level 0,1,2 (min to max)
 MODULE_API_GMW void gmw_set_log_level(int level);
+// Install a process-wide log sink BEFORE gmw_init so the full handshake and
+// failure trace is captured even when stdout is unavailable (Windows GUI
+// apps). verbose: 0=errors only ... 2=full trace (applied via the log level).
+// fn may be called from any thread.
+MODULE_API_GMW void gmw_set_log_callback(void (*fn)(const char* msg), int verbose);
+// Codec-corpus capture: start dumping uncompressed pre-encode frames into
+// <dir>/frame_WxH_fmt_NNNNNN.raw, auto-stop after maxFrames (0 = default 120).
+// dir=NULL/"" disables. Also auto-enabled by env GM_FRAME_DUMP=<dir>
+// (GM_FRAME_DUMP_MAX caps the count). Call from the thread driving gmw_blit.
+MODULE_API_GMW void gmw_set_frame_dump(const char* dir, uint32_t maxFrames);
+// NLC codec tuning, effective when gmw_init lz4Frames = NLC (7). All ride the
+// CMD_INIT byte[1] packing so they MUST be called BEFORE gmw_init.
+// near: 0 = lossless (default), 1..3 = +-k near-lossless quantization. Bits [3:2].
+// near 1 is the recommended setting for heavy 3D content (it is what brings the
+// stream under the core's ~38 MB/s ingest ceiling; ±1 is analog-invisible).
+MODULE_API_GMW void gmw_set_near_level(uint8_t k);
+// pack: NLC entropy front-end (byte[1] bit 7). 1 = TILED (block-adaptive widths,
+// default; better on flat/2D content), 2 = RICE (Golomb-Rice; better on
+// photographic/3D content). RICE REQUIRES a core with the Rice decoder (the
+// rbf_rice_r3 kit or newer); an older core ignores the bit and would misparse
+// Rice bytes as TILED (garbage picture, no wedge). Values other than 2 clamp
+// to TILED.
+MODULE_API_GMW void gmw_set_nlc_pack(uint8_t pack);
+// NLC display path (CMD_INIT byte[1] bits [6:5]): 0 = stream, 2 = autonomous
+// engine (default; the rock-solid display path). Call BEFORE gmw_init.
+MODULE_API_GMW void gmw_set_nlc_disp_mode(uint8_t mode);
+// Opt-in ACK watchdog (default OFF): after 10 blits with no frameEcho advance
+// the client reconnects transparently inside gmw_blit — video side only, the
+// inputs socket survives — and replays the stashed modeline. Observe via
+// gmw_reconnect_epoch().
+MODULE_API_GMW void gmw_set_auto_reconnect(uint8_t on);
 
 
 /* Inspired by https://stackoverflow.com/a/1067684 */
@@ -200,6 +299,20 @@ typedef struct MODULE_API_GMW
 	void (*getPS2Inputs)(gmw_fpgaPS2Inputs* ps2Inputs);
 	const char* (*get_version)(void);
 	void (*set_log_level) (int level);
+	/* v2 additions — appended only, existing offsets unchanged */
+	void (*send_close)(void);
+	uint8_t (*is_connected)(void);
+	uint32_t (*reconnect_epoch)(void);
+	void (*resubscribe_inputs)(void);
+	void (*set_input_caps)(uint8_t caps);
+	uint8_t (*get_input_caps)(void);
+	void (*send_rumble)(uint8_t player, uint8_t strong, uint8_t weak);
+	void (*set_log_callback)(void (*fn)(const char* msg), int verbose);
+	void (*set_frame_dump)(const char* dir, uint32_t maxFrames);
+	void (*set_near_level)(uint8_t k);
+	void (*set_nlc_pack)(uint8_t pack);
+	void (*set_nlc_disp_mode)(uint8_t mode);
+	void (*set_auto_reconnect)(uint8_t on);
 } gmwAPI;
 
 

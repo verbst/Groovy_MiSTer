@@ -38,7 +38,12 @@ module hps_ext
     input             vram_synced,
     input             vram_end_frame,
     input             vram_ready,
-    output reg        cmd_init = 0, 
+    output reg        cmd_init = 0,
+    output reg [1:0]  codec_mode = 0,   // 0=raw, 1=LZ4, 2=NLC. Decoded from the init command word [2:1].
+    output reg [1:0]  nlc_near   = 0,   // NLC NEAR level (0=lossless, 1/2=near). Init word [4:3].
+    output reg        nlc_color  = 1,   // NLC colour transform: 1=YCoCg-R (default), 0=RGB-direct. Init word [5].
+    output reg [1:0]  nlc_disp_mode = 0, // /46 NLC display path: 0=/45 stream, 1=B-throttle, 2=B-autonomous. Init word [7:6].
+    output reg        nlc_rice   = 0,   // R3: NLC entropy pack: 1=Golomb-Rice, 0=TILED (default). Init word [8].
     input             reset_switchres,
     output reg        cmd_switchres = 0,    
     output reg [31:0] switchres_frame = 0,             
@@ -54,9 +59,14 @@ module hps_ext
     output reg [1:0]  lz4_ABCD = 0,
     output reg [1:0]  lz4_field = 0,
 	 output reg        lz4_delta = 0,
-    input      [31:0] lz4_uncompressed_bytes,   
-    output reg        cmd_blit_vsync = 0
-/* DEBUG    
+    input      [31:0] lz4_uncompressed_bytes,
+    output reg        cmd_blit_vsync = 0,
+    // /55-/56 wedge telemetry (GET_GROOVY_STATUS words 10-13; all PIPELINED regs in Groovy.sv)
+    input      [15:0] dbg_live_a,    // live: {ddram_state, mux_grant, eng_state, fsm_state}
+    input      [15:0] dbg_live_b,    // live: done/ddto/wd counters + flags
+    input      [15:0] dbg_frz_a,     // word12: freeze latch OR live eng_cur_frame
+    input      [15:0] dbg_frz_b      // word13: freeze context OR live {syncloss, flushed}
+/* DEBUG
     input      [31:0]  PoC_subframe_wr_bytes,
     input             lz4_run,
     input             PoC_lz4_resume,
@@ -111,7 +121,8 @@ reg        hps_vram_ready;
 
 reg[31:0]  hps_lz4_uncompressed_bytes;
 
-
+// /55 telemetry snapshot (same coherency treatment as the other status fields)
+reg[15:0]  hps_dbg_live_a, hps_dbg_live_b, hps_dbg_frz_a, hps_dbg_frz_b;
 
 reg[15:0]  m_temp;
 
@@ -184,8 +195,12 @@ always@(posedge clk_sys) begin
                                               hps_vram_queue     <= vram_queue;
                                               hps_vram_synced    <= vram_synced;
                                               hps_vram_end_frame <= vram_end_frame;
-                                              hps_vram_ready     <= vram_ready;                                          
-                                              hps_lz4_uncompressed_bytes <= lz4_uncompressed_bytes;															
+                                              hps_vram_ready     <= vram_ready;
+                                              hps_lz4_uncompressed_bytes <= lz4_uncompressed_bytes;
+                                              hps_dbg_live_a     <= dbg_live_a;
+                                              hps_dbg_live_b     <= dbg_live_b;
+                                              hps_dbg_frz_a      <= dbg_frz_a;
+                                              hps_dbg_frz_b      <= dbg_frz_b;
 // DEBUG 
 /*
                                               hps_state <= state;
@@ -210,8 +225,13 @@ always@(posedge clk_sys) begin
                                            5: io_dout <= hps_vram_queue[23:8];                                                                                       
                                            6: io_dout <= hps_vram_pixels[15:0];
                                            7: io_dout <= {8'd0, hps_vram_pixels[23:16]};                                           
-                                           8: io_dout <= hps_lz4_uncompressed_bytes[15:0];                                     
-                                           9: io_dout <= hps_lz4_uncompressed_bytes[31:16]; 
+                                           8: io_dout <= hps_lz4_uncompressed_bytes[15:0];
+                                           9: io_dout <= hps_lz4_uncompressed_bytes[31:16];
+                                           // /55 wedge telemetry (read by groovy.cpp when compression is on)
+                                           10: io_dout <= hps_dbg_live_a;
+                                           11: io_dout <= hps_dbg_live_b;
+                                           12: io_dout <= hps_dbg_frz_a;
+                                           13: io_dout <= hps_dbg_frz_b;
 // DEBUG 
 /*
                                            10: io_dout <= hps_state;
@@ -250,10 +270,16 @@ always@(posedge clk_sys) begin
                                            2:
                                            begin
                                              sound_rate <= io_din[1:0];
-                                             sound_chan <= io_din[3:2];   
-                                             rgb_mode   <= io_din[5:4]; 
-                                             cmd_init   <= m_temp[0];                                            
-                                           end                                                                                                                  
+                                             sound_chan <= io_din[3:2];
+                                             rgb_mode   <= io_din[5:4];
+                                             cmd_init   <= m_temp[0];
+                                             // codec + NLC params packed in the init word: [2:1]=codec_mode [4:3]=nlc_near [5]=nlc_color
+                                             codec_mode    <= m_temp[2:1];
+                                             nlc_near      <= m_temp[4:3];
+                                             nlc_color     <= m_temp[5];
+                                             nlc_disp_mode <= m_temp[7:6];   // /46 runtime NLC display mode
+                                             nlc_rice      <= m_temp[8];     // R3: entropy pack (1=Golomb-Rice)
+                                           end
                                          endcase 
                                                 
                                 SET_SWITCHRES: case(byte_cnt)

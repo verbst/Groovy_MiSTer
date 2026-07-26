@@ -1,0 +1,6 @@
+QUARTUS_VERSION = "17.0"
+DATE = "2026/07/01"
+
+# Standalone project: synthesize nlc_decode_ddr to a POST-FIT gate-level netlist
+# so we can simulate the REAL Cyclone V primitives (M10K line buffers) vs golden.
+PROJECT_REVISION = "nlc_gate"

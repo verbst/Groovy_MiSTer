@@ -1,0 +1,38 @@
+# nlc_gate.qsf — standalone synth of nlc_decode_ddr (the NLC decoder wrapper, incl. the M10K
+# line buffers) so we can emit a POST-FIT gate-level netlist and simulate the REAL Cyclone V
+# primitives against the golden vectors. Same device as Groovy.qsf.
+
+set_global_assignment -name FAMILY "Cyclone V"
+set_global_assignment -name DEVICE 5CSEBA6U23I7
+set_global_assignment -name TOP_LEVEL_ENTITY nlc_decode_ddr
+set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
+
+# --- source (the DUT only) ---
+set_global_assignment -name VERILOG_FILE ../../rtl/nlc_decode_ddr.v
+set_global_assignment -name VERILOG_FILE ../../rtl/nlc_plane_core.v
+
+# --- EDA netlist writer: emit a Verilog gate-level sim netlist (post-fit) ---
+set_global_assignment -name EDA_SIMULATION_TOOL "Custom Verilog HDL"
+set_global_assignment -name EDA_OUTPUT_DATA_FORMAT "VERILOG HDL" -section_id eda_simulation
+set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_simulation
+set_global_assignment -name EDA_TIME_SCALE "1 ps" -section_id eda_simulation
+
+# --- all top-level ports VIRTUAL (module has ~275 I/O > physical pins; sim only) ---
+set_instance_assignment -name VIRTUAL_PIN ON -to clk
+set_instance_assignment -name VIRTUAL_PIN ON -to reset
+set_instance_assignment -name VIRTUAL_PIN ON -to cfg_w
+set_instance_assignment -name VIRTUAL_PIN ON -to cfg_h
+set_instance_assignment -name VIRTUAL_PIN ON -to cfg_near
+set_instance_assignment -name VIRTUAL_PIN ON -to cfg_tile
+set_instance_assignment -name VIRTUAL_PIN ON -to cfg_color
+set_instance_assignment -name VIRTUAL_PIN ON -to compressed_long
+set_instance_assignment -name VIRTUAL_PIN ON -to write_long
+set_instance_assignment -name VIRTUAL_PIN ON -to write_ready
+set_instance_assignment -name VIRTUAL_PIN ON -to uncompressed_long
+set_instance_assignment -name VIRTUAL_PIN ON -to long_valid
+set_instance_assignment -name VIRTUAL_PIN ON -to out_ready
+set_instance_assignment -name VIRTUAL_PIN ON -to uncompressed_bytes
+set_instance_assignment -name VIRTUAL_PIN ON -to writed_bytes
+set_instance_assignment -name VIRTUAL_PIN ON -to readed_bytes
+set_instance_assignment -name VIRTUAL_PIN ON -to paused
+set_instance_assignment -name VIRTUAL_PIN ON -to done
