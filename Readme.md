@@ -1,8 +1,8 @@
 # Groovy core for MiSTer
 
-This version hadds new NLC compress, input support and stability improvements (particularly for 480i/480p).
+This version hadds new NLC compression, input support and stability improvements (particularly for 480i/480p).
 The emulators below are validated with this version. Older emulators w/groovy are untested, and maybe have input issues. It is recommended to use the updated NLC versions.
-
+See releases for more details
 
 ## General description
 This core is a analog GPU for CRTs aiming for very low subframe latency
