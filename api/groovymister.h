@@ -158,8 +158,9 @@ class GroovyMister
 	void setNlcPack(uint8_t pack);       // R0/R5: NLC entropy front-end: 1=TILED (default), 2=RICE (CMD_INIT byte[1] bit 7)
 	void setNearLevel(uint8_t lvl);      // NLC near-lossless level 0-3 (0=lossless default; CMD_INIT byte[1] bits [3:2])
 	void setInputCaps(uint8_t caps);     // GM_CAP_* input capabilities — set before CmdInit (0 = legacy v1 inputs)
-	// Change resolution (check https://github.com/antonioginer/switchres) with modeline
-	void CmdSwitchres(double pClock, uint16_t hActive, uint16_t hBegin, uint16_t hEnd, uint16_t hTotal, uint16_t vActive, uint16_t vBegin, uint16_t vEnd, uint16_t vTotal, uint8_t interlace);
+	// Change resolution (check https://github.com/antonioginer/switchres) with modeline.
+	// Returns 0 on success (ACK'd), -1 if not connected or the ACK never arrived after retrying.
+	int CmdSwitchres(double pClock, uint16_t hActive, uint16_t hBegin, uint16_t hEnd, uint16_t hTotal, uint16_t vActive, uint16_t vBegin, uint16_t vEnd, uint16_t vTotal, uint8_t interlace);
 	// Stream frame, field = 0 for progressive, vCountSync = 0 for auto frame delay or number of vertical line to sync with, margin with nanoseconds for auto frame delay)
 	void CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, uint32_t margin, uint32_t matchDeltaBytes);
 	// Stream audio
@@ -185,6 +186,13 @@ class GroovyMister
 	// queues — an async RIOSend there can be silently dropped, leaving the
 	// core frozen on the last frame instead of returning to connection-search.
 	void CmdSendClose(void);
+	// Send a 1-byte CMD_GET_STATUS keepalive on the video socket (normal send
+	// path: RIO on Windows). Call at <= (idle timeout)/2 while alive but not
+	// blitting (paused / loading / in a menu) to hold the session open against
+	// the core's idle timeout (OSD: Server -> Idle timeout). Any datagram resets
+	// the core's activity timer; CMD_GET_STATUS just has no side effects. No-op
+	// unless a session is live.
+	void CmdSendKeepAlive(void);
 	// Re-send the 1-byte input subscribe on the existing inputs socket.
 	// UDP-loss insurance for threaded clients; no-op before BindInputs.
 	void ResendInputSubscribe(void);
@@ -196,6 +204,13 @@ class GroovyMister
 	// Opt-in ACK watchdog (default OFF): after 10 blits with no frameEcho
 	// advance, CmdBlit transparently reconnects — video side only, the inputs
 	// socket and its local port survive — and replays the stashed modeline.
+	// CmdInit re-zeroes fpga.* + m_frame on every (re)connect, so a stale
+	// session's counter can never leak into the raster servo, and DiffTimeRaster
+	// clamps an implausible echo/gpu spread to skip (never hang) the sync. The
+	// core restarts its own frame counter on the fresh session, so for full
+	// raster-sync recovery an integrator should realign its own blit-frame
+	// counter when reconnectEpoch() changes (a divergent counter still runs,
+	// just coarser-paced, thanks to the clamp).
 	void setAutoReconnect(uint8_t on);
 	// Monotonic count of successful auto-reconnects (host observability)
 	uint32_t reconnectEpoch(void);
@@ -322,6 +337,7 @@ class GroovyMister
 	uint64_t m_rioLastSummaryMs;     // rate-limit for the telemetry summary line
 
 	void teardownVideo(void);
+	void resetSessionState(void); // zero the per-session raster state (fpga.* + m_frame); constructor + every CmdInit
 	uint32_t drainSendCompletions(void);
 	uint8_t inputsBound(void);
 	uint64_t monotonicMs(void);

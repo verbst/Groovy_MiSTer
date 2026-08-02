@@ -64,6 +64,16 @@ MODULE_API_GMW void gmw_send_close(void)
 	}
 }
 
+// Send a 1-byte CMD_GET_STATUS keepalive to hold an idle session against the
+// core's idle timeout. Call while alive but not blitting (paused/loading/menu).
+MODULE_API_GMW void gmw_send_keepalive(void)
+{
+	if (gmw != NULL)
+	{
+		gmw->CmdSendKeepAlive();
+	}
+}
+
 MODULE_API_GMW uint8_t gmw_is_connected(void)
 {
 	return (gmw != NULL) ? gmw->isConnected() : 0;

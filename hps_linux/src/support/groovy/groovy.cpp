@@ -72,6 +72,10 @@ static constexpr auto AUDIO_CHANNELS_OPT = "[55:54]";
 static constexpr auto RGB_MODE_OPT = "[57:56]";
 static constexpr auto LZ4_OPT = "[58]";
 static constexpr auto SERVER_TYPE_OPT = "[59]";
+// Idle timeout: close a session whose client has gone silent (killed/crashed/network drop) so the
+// CRT is freed instead of holding the last frame forever. HPS-only option on free bits [8:7]
+// (FPGA never wires them). 0=Off preserves the legacy infinite-hold. See the idle-timeout handoff.
+static constexpr auto IDLE_TIMEOUT_OPT = "[8:7]";
 
 // FPGA SPI commands
 #define UIO_GET_GROOVY_STATUS     0xf0
@@ -416,6 +420,12 @@ static uint8_t doARMClock = 0;
 static uint8_t isConnected = 0;
 static uint8_t isConnectedInputs = 0;
 static uint8_t isConnectedGMC = 0;
+// Idle-timeout state (see IDLE_TIMEOUT_OPT). idleTimeoutMs 0 = disabled. sawActivity is set on
+// every received datagram (a single byte store, no clock read, to keep the blit hot-path free);
+// the deadline is refreshed / checked once per poll in groovy_poll()'s housekeeping.
+static uint32_t idleTimeoutMs = 0;
+static unsigned long idleDeadline = 0;
+static uint8_t sawActivity = 0;
 
 
 /* FPGA HPS EXT STATUS */
@@ -474,6 +484,12 @@ static inline void initDDR()
 
 static void initVerboseFile()
 {
+	// fp lives for the whole HPS process lifetime (never fclose()'d). This is called again on
+	// every CMD_INIT while doVerbose is on (including reconnects from a USB hotplug stall) - guard
+	// against re-opening in "wt" (truncate) mode each time, or every reconnect wipes out the exact
+	// evidence needed to diagnose it. Only the first call (process startup, or the first CMD_INIT
+	// if verbose was toggled on after boot) actually creates/truncates the file.
+	if (fp) return;
 	fp = fopen("/tmp/groovy.log", "wt");
 	if (!fp)
 	{
@@ -501,10 +517,13 @@ static void groovy_FPGA_hps()
     doScreensaver = (uint8_t) !user_io_status_get(SCREENSAVER_OPT); 
     doPs2Inputs = (uint8_t) user_io_status_get(PS2_INPUTS_OPT);  
     doJoyInputs = (uint8_t) user_io_status_get(JOY_INPUTS_OPT);      
-    doJumboFrames = (uint8_t) user_io_status_get(JUMBO_FRAMES_OPT);      
-    doARMClock = (uint8_t) user_io_status_get(ARM_CLOCK_OPT);  
+    doJumboFrames = (uint8_t) user_io_status_get(JUMBO_FRAMES_OPT);
+    doARMClock = (uint8_t) user_io_status_get(ARM_CLOCK_OPT);
 
-    LOG(0, "[HPS][doVerbose=%d hpsBlit=%d doScreenSaver=%d doPs2Inputs=%d doJoyInputs=%d doJumboFrames=%d doXDPServer=%d doARMClock=%d]\n", doVerbose, hpsBlit, doScreensaver, doPs2Inputs, doJoyInputs, doJumboFrames, doXDPServer, doARMClock);
+    static const uint16_t idleSecs[4] = {5, 10, 15, 0};   // OSD order: 5s,10s,15s,Off (index 3 -> disabled)
+    idleTimeoutMs = (uint32_t) idleSecs[user_io_status_get(IDLE_TIMEOUT_OPT) & 3] * 1000u;
+
+    LOG(0, "[HPS][doVerbose=%d hpsBlit=%d doScreenSaver=%d doPs2Inputs=%d doJoyInputs=%d doJumboFrames=%d doXDPServer=%d doARMClock=%d idleTimeoutMs=%u]\n", doVerbose, hpsBlit, doScreensaver, doPs2Inputs, doJoyInputs, doJumboFrames, doXDPServer, doARMClock, idleTimeoutMs);
     
     user_io_status_set(AUDIO_RATE_OPT, (uint32_t)0);
     user_io_status_set(AUDIO_CHANNELS_OPT, (uint32_t)0);
@@ -947,10 +966,13 @@ static void setClose()
 {
 	groovy_FPGA_init(0, 0, 0, 0);
 	isBlitting = 0;
+	isCorePriority = 0;   // defensive: a mid-blit caller (idle timeout) leaves this 1; the poll loop would spin
 	usingOldBlit = 0;
 	numBlit = 0;
 	blitCompression = 0;
-	free(poc);
+	free(poc);   // NOT nulled on purpose: groovy_FPGA_status() (called by loadLogo() below) dereferences
+	             // poc->PoC_interlaced, and the logo path runs with no active session. Setting poc=NULL here
+	             // caused a NULL-deref crash. Double-free is prevented by the isConnected gate on CMD_CLOSE.
 	initDDR();
 	isConnected = 0;
 	isConnectedInputs = 0;
@@ -1320,14 +1342,30 @@ static void setInit(uint8_t compression, uint8_t audio_rate, uint8_t audio_chan,
 	isBlitting = 0;
 	usingOldBlit = 0;
 	numBlit = 0;
+	idleDeadline = GetTimer(idleTimeoutMs);   // arm the idle timeout for this session (harmless if disabled)
+	sawActivity = 0;
 
 
 	char hoststr[NI_MAXHOST];
 	char portstr[NI_MAXSERV];
+
+	// Force a genuine cmd_init edge on EVERY (re)connect, unconditionally - not just when
+	// doScreensaver is on. A reconnect's CMD_CLOSE is a single best-effort UDP datagram (see
+	// the auto-reconnect watchdog in api/groovymister.cpp); if it's lost (a real network drop,
+	// or an HPS-thread stall e.g. from USB hotplug rescanning /dev/input starving groovy_poll())
+	// setClose() never runs, so cmd_init never drops on its own. Without this, the FPGA's
+	// blit-FSM state never revisits S_Idle, so PoC_frame_lz4 (and sibling frame counters) never
+	// re-zero - every future frame from this fresh, low-numbered session then fails the core's
+	// strict-monotonic frame-adoption gate (Groovy.sv: S_Blit_Header_NLC/S_Blit_Setup_NLC,
+	// `new_frame > PoC_frame_lz4`) for the rest of the session: corrupted/frozen video that
+	// only a full core reset clears. This pulse must happen BEFORE the fpga_init poll below
+	// (fpga_init mirrors "FSM state != S_Idle", rtl/hps_ext.v GET_GROOVY_STATUS byte 4) - a
+	// stale cmd_init would otherwise spin that poll forever instead of just this one frame.
+	groovy_FPGA_init(0, 0, 0, 0);
+
 	// load LOGO
 	if (doScreensaver)
 	{
-		groovy_FPGA_init(0, 0, 0, 0);
 		groovy_FPGA_logo(0);
 		groovyLogo = 0;
 	}
@@ -2119,7 +2157,10 @@ gmc_error:
 static inline void process_packet(char *recvbufPtr, int len)
 {
 	if (len > 0)
-	{		
+	{
+		sawActivity = 1;   // idle-timeout liveness: any datagram (blit chunk, audio, CMD_GET_STATUS
+		                   // keepalive, ...) counts. Single byte store only - the deadline math runs
+		                   // once per poll in groovy_poll(), never in this per-chunk path.
 		if (isBlitting)
 		{
 			//udp error lost detection (jumbo to do)
@@ -2186,8 +2227,8 @@ static inline void process_packet(char *recvbufPtr, int len)
 				
 	    			case CMD_CLOSE:
 				{
-					if (len == 1)
-					{
+					if (len == 1 && isConnected)   // ignore duplicate/stale closes: re-running teardown
+					{                              // on an already-closed core double-freed poc (now NULLed too)
 						LOG(1, "[CMD_CLOSE][%d]\n", recvbufPtr[0]);
 						setClose();
 					}
@@ -2219,7 +2260,10 @@ static inline void process_packet(char *recvbufPtr, int len)
 					if (len == 26)
 					{
 						LOG(1, "[CMD_SWITCHRES][%d]\n", recvbufPtr[0]);
-			       			setSwitchres(&recvbufPtr[0]);			       			
+			       			setSwitchres(&recvbufPtr[0]);
+			       			sendACK(0, 0); // CmdSwitchres now waits for this + retries (see api/groovymister.cpp);
+			       			                // previously unacknowledged, so a lost packet on reconnect left
+			       			                // PoC_bytes_len at 0 forever (silent "no modeline" packet drops).
 			       		}
 				}; break;
 
@@ -2304,7 +2348,12 @@ static inline void process_packet(char *recvbufPtr, int len)
 
 				default:
 				{
-					LOG(1,"command: %i (len=%d)\n", recvbufPtr[0], len);
+					// Fires for every ordinary blit-continuation payload packet while !isBlitting
+					// (i.e. essentially every packet, in normal operation) - pure noise at doVerbose=1,
+					// where it dwarfs every other line in the file. Bumped to severity 2 so it's
+					// filtered out at the verbosity level actually used for diagnosis; the real error
+					// signal (UDP_ERROR/RECONFIG) is severity 0 and always logged regardless.
+					LOG(2,"command: %i (len=%d)\n", recvbufPtr[0], len);
 				}
 			}
 		}
@@ -2776,7 +2825,8 @@ void groovy_poll()
 
 	do
 	{
-		if (doVerbose == 3 && isConnected && poc->PoC_bytes_len > 0)		
+		uint8_t gotData = 0;   // idle-timeout: did THIS iteration receive a datagram? (UDP path)
+		if (doVerbose == 3 && isConnected && poc->PoC_bytes_len > 0)
 		{
 			groovy_FPGA_status(0);
 			//LOG(3, "[GET_STATUS][DDR fr=%d bl=%d][GPU vc=%d fr=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][LZ4 state_1=%d inf=%d wr=%d, run=%d resume=%d t1=%d t2=%d cmd_fskip=%d stop=%d AB=%d com=%d grav=%d lleg=%d, sub=%d blit=%d]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_vcount, fpga_vga_frame, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_lz4_state, fpga_lz4_uncompressed, fpga_lz4_writed, fpga_lz4_run, fpga_lz4_resume, fpga_lz4_test1, fpga_lz4_test2, fpga_lz4_cmd_fskip, fpga_lz4_stop, fpga_lz4_ABCD, fpga_lz4_compressed, fpga_lz4_gravats, fpga_lz4_llegits, fpga_lz4_subframe_bytes, fpga_lz4_subframe_blit);
@@ -2793,6 +2843,7 @@ void groovy_poll()
 				// run inline); the per-chunk ASAP watermark notify is deferred to ONE per batch.
 				for (int i = 0; i < RECV_BATCH; i++) recvMsgs[i].msg_hdr.msg_namelen = sizeof(recvAddrs[i]);
 				int n = recvmmsg(sockfd, recvMsgs, RECV_BATCH, MSG_WAITFORONE, NULL);
+				if (n > 0) gotData = 1;
 				uint8_t gotPayload = 0;
 				recvNotifyDefer = 1;
 				for (int i = 0; i < n; i++)
@@ -2824,6 +2875,7 @@ void groovy_poll()
 				// /58 mode 1: cached bounce + wide-store copy (protocol-identical to mode 0 —
 				// same per-chunk notifies; only the payload's route into the window changes)
 				int len = recvfrom(sockfd, (char *) &recvbuf[0], 65536, 0, (struct sockaddr *)&clientaddr, &clilen);
+				if (len > 0) gotData = 1;
 				if (len > 0)
 					ddr_wide_copy((char *) (buffer + HEADER_OFFSET + poc->PoC_buffer_offset + poc->PoC_bytes_recv), (char *) &recvbuf[0], len);
 				process_packet((char *) &recvbuf[0], len);
@@ -2833,20 +2885,52 @@ void groovy_poll()
 				// mode 0 / idle: the legacy path (commands always land in recvbuf)
 				char* recvbufPtr = (isBlitting) ? (char *) (buffer + HEADER_OFFSET + poc->PoC_buffer_offset + poc->PoC_bytes_recv) : (char *) &recvbuf[0];
 				int len = recvfrom(sockfd, recvbufPtr, 65536, 0, (struct sockaddr *)&clientaddr, &clilen);
+				if (len > 0) gotData = 1;
 				process_packet(recvbufPtr, len);
 			}
 		}
 #ifdef _AF_XDP
 		else
-		{						
-			handle_receive_packets(xsk_socket);			
+		{
+			handle_receive_packets(xsk_socket);
+			gotData = 1;   // XDP: leave the idle close to the once-per-poll housekeeping check (see R7)
 		}
-#endif		
+#endif
+		// idle timeout (mid-blit): a client that dies mid-frame leaves isCorePriority set, so this
+		// non-blocking loop would otherwise spin forever. Bail only on a no-data iteration once the
+		// deadline has passed - never during active draining or a healthy inter-chunk gap (gotData guards it).
+		if (!gotData && idleTimeoutMs && isConnected && CheckTimer(idleDeadline))
+		{
+			LOG(0, "[TIMEOUT][no client activity %ums][isBlitting=%d isCorePriority=%d]\n", idleTimeoutMs, isBlitting, isCorePriority);
+			if (fp) fflush(fp);   // flush the diagnostic to disk BEFORE setClose, so it survives even if
+			                      // anything downstream misbehaves (the end-of-poll flush may never run)
+			setClose();           // setClose() clears isBlitting + isCorePriority; identical to the CMD_CLOSE path
+			break;
+		}
 	} while (isCorePriority);
 
 	if (doScreensaver && groovyLogo)
 	{
 		loadLogo(0);
+	}
+
+	// idle timeout (once per poll): refresh the deadline if any datagram arrived this poll, else close
+	// a session whose client has gone silent (killed/crashed/network drop). A client that is alive but
+	// not blitting keeps the session by sending CMD_GET_STATUS (or any datagram) - see the keepalive
+	// contract in the integration handoff. No-op when disabled (idleTimeoutMs==0) or disconnected.
+	if (isConnected && idleTimeoutMs)
+	{
+		if (sawActivity)
+		{
+			idleDeadline = GetTimer(idleTimeoutMs);
+			sawActivity = 0;
+		}
+		else if (CheckTimer(idleDeadline))
+		{
+			LOG(0, "[TIMEOUT][no client activity %ums][isBlitting=%d isCorePriority=%d][housekeeping]\n", idleTimeoutMs, isBlitting, isCorePriority);
+			if (fp) fflush(fp);
+			setClose();
+		}
 	}
 
 	if (doVerbose > 0 && CheckTimer(logTime))
