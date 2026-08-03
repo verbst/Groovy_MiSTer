@@ -10,8 +10,9 @@ This core is a analog GPU for CRTs aiming for very low subframe latency
 https://youtu.be/H0175WJFpUs
 ## This Fork's Features 
 - Lower network bandwidth requirements for a more stable playback experience (YCoCg-R & Rice to create NLC compression (Lossless & Near Lossless))
-- Extended controller support (Full Dualshock w/Rumble)
 - Connection stability fixes, reconnect and auto connection closing
+- Extended controller support (Full Dualshock w/Rumble)
+- Controller menu updates. Reassign a single button or swap profiles quickly within the new Controller MiSTer UI.
 
 ## Features 
 - Very low latency (~3ms tested with GILT on GroovyMAME with frame delay 8)
