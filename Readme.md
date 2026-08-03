@@ -10,6 +10,9 @@ This core is a analog GPU for CRTs aiming for very low subframe latency
 https://youtu.be/H0175WJFpUs
 
 ## Features 
+- This fork adds:
+-- YCoCg-R & Rice to create NLC compression (Lossless & Near Lossless)
+-- 
 - Very low latency (~3ms tested with GILT on GroovyMAME with frame delay 8)
 - RGB888/RGB565/RGBA888 blitting
 - Switch all modes (progressive/interlaced) reprogramming pll according to modeline
