@@ -12,7 +12,7 @@ https://youtu.be/H0175WJFpUs
 - Lower network bandwidth requirements for a more stable playback experience (YCoCg-R & Rice to create NLC compression (Lossless & Near Lossless))
 - Connection stability fixes, reconnect and auto connection closing
 - Extended controller support (Full Dualshock w/Rumble)
-- Controller menu updates. Reassign a single button or swap profiles quickly within the new Controller MiSTer UI.
+- Controller menu updates. Reassign a single button or swap profiles quickly within the new Controller MiSTer UI. Handy when swapping between different emulators.
 
 ## Features 
 - Very low latency (~3ms tested with GILT on GroovyMAME with frame delay 8)
