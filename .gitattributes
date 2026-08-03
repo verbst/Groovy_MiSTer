@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts must check out with LF regardless of the checking-out client's
+# core.autocrlf - a CRLF shebang line is unexecutable under WSL/bash.
+*.sh text eol=lf

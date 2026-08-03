@@ -10,6 +10,10 @@
 module clean_disp_tb;
     integer N_FRAMES, CADENCE, CODEC, DEBUG, ILACE, W, H, CHUNK, NMARK, CEPIX, NLCMODE, CHUNKGAP;
     integer WMDROP, WMRACEG; reg WMRACE;
+    // /58 reconnect repro: pulse cmd_init low/high + replay CmdSwitchres right after frame
+    // RECONNECT_AFTER streams (0 = disabled, default). RECONNECT_LOWCYC = how long to hold cmd_init
+    // low (mirrors the real setInit() forced edge landing over SPI, not an instant toggle).
+    integer RECONNECT_AFTER, RECONNECT_LOWCYC, TRACE_WINDOW_CYC;
     reg        wmrace_pend = 0;          // a final watermark rewrite is deferred into the next announce
     reg [63:0] wmrace_hdr  = 0;
     integer HFP, HSv, HBP, VFP, VSv, VBP;     // modeline porches to send (defaults = real 720x480i)
@@ -40,16 +44,47 @@ module clean_disp_tb;
         if (!$value$plusargs("wmdrop=%d",    WMDROP))   WMDROP   = 0;
         WMRACE = $test$plusargs("wmrace");
         if (!$value$plusargs("wmracegap=%d", WMRACEG))  WMRACEG  = 20;
+        if (!$value$plusargs("reconnect_after=%d", RECONNECT_AFTER)) RECONNECT_AFTER = 0;
+        if (!$value$plusargs("reconnect_lowcyc=%d", RECONNECT_LOWCYC)) RECONNECT_LOWCYC = 50;
+        if (!$value$plusargs("trace_window=%d", TRACE_WINDOW_CYC)) TRACE_WINDOW_CYC = 3000000;
         if (!$value$plusargs("hfp=%d", HFP)) HFP = 29;
         if (!$value$plusargs("hs=%d",  HSv)) HSv = 69;
         if (!$value$plusargs("hbp=%d", HBP)) HBP = 117;
         if (!$value$plusargs("vfp=%d", VFP)) VFP = 3;
         if (!$value$plusargs("vs=%d",  VSv)) VSv = 6;
         if (!$value$plusargs("vbp=%d", VBP)) VBP = 34;
+        if (!$value$plusargs("pll_glitch_ns=%d", PLL_GLITCH_NS)) PLL_GLITCH_NS = 0;
+        if (!$value$plusargs("pll_glitch_period_ns=%d", PLL_GLITCH_PERIOD_NS)) PLL_GLITCH_PERIOD_NS = 6;
     end
 
+    // /58 PLL-relock-gap repro: this sim cannot model a real analog PLL relock transient (Verilator
+    // has no setup/hold-time concept) - but it CAN model the logical gap found in Groovy.sv: nothing
+    // in the clk_sys domain ever waits for pll_locked before resuming after a CmdSwitchres replay
+    // (S_Switchres_PLL -> S_Switchres_Mode unconditionally, Groovy.sv:1294). +pll_glitch_ns=N
+    // (default 0 = disabled, no effect on any existing invocation) freezes clk_sys's toggling for N ns,
+    // triggered right at a simulated reconnect's CmdSwitchres replay (do_reconnect, below), standing in
+    // for "the real PLL output is unlocked/retuning here and nothing waits for it."
+    // NOTE: force/release on clk_sys crashes Verilator internally ("destroy locked Thread Pool")
+    // under --timing mode - not used. Restructuring the plain `always #6 clk_sys=~clk_sys` oscillator
+    // into a conditional also costs a large (~15x) sim-speed regression (Verilator loses whatever
+    // fast-path it has for the bare idiom) - accepted here deliberately since this is a one-off
+    // diagnostic build, not the default; +pll_glitch_ns=0 (the default) restores the plain oscillator
+    // behavior exactly, so unrelated/normal sim runs should use an unmodified clean_disp build if speed
+    // matters.
+    integer PLL_GLITCH_NS;
+    reg     pll_glitch_active = 1'b0;
+    // a full clock STOP is actually the safest possible perturbation (everything pauses and resumes
+    // in perfect sync) - a real unlocked PLL is more likely to keep producing edges at a WRONG rate
+    // (VCO over/undershoot) than to stop outright. +pll_glitch_period_ns=P (default 6 = no change)
+    // sets the half-period used WHILE pll_glitch_active is set, instead of stopping clk_sys.
+    integer PLL_GLITCH_PERIOD_NS;
+
     // ----------------------------------------------------------------- clock + ce_pix (clean Groovy.sv:505)
-    reg clk_sys = 0; always #6 clk_sys = ~clk_sys;
+    reg clk_sys = 0;
+    always begin
+        if (pll_glitch_active) #(PLL_GLITCH_PERIOD_NS); else #6;
+        clk_sys = ~clk_sys;
+    end
     integer cycles = 0; always @(posedge clk_sys) cycles = cycles + 1;
     wire [7:0] ce_pix_arm = (cmd_scandoubler && PoC_pll_S) ? (PoC_ce_pix >> 1) - 8'd1 : PoC_ce_pix - 8'd1;
     reg [3:0] cencnt = 4'd0;
@@ -375,7 +410,9 @@ module clean_disp_tb;
     reg [1:0]  PoC_lz4_delta_index = 0;
     reg [27:0] PoC_lz4_delta_bytes = 0;
     reg [63:0] PoC_lz4_delta_FB [0:3];   // delta-frame buffer (non-delta path unused; declared for the FSM)
-    wire       cmd_init = 1'b1;
+    // /58 reconnect repro: was a tied-high wire (never exercised a reconnect). Now driveable so
+    // do_reconnect (below) can pulse it low/high exactly like the real setInit() forced edge (/87 fix).
+    reg        cmd_init = 1'b1;
     wire       cmd_audio = 1'b0, cmd_logo = 1'b0, cmd_scandoubler = 1'b0;
     wire       hps_frameskip = 1'b1;
     wire [1:0] scandoubler_fx = 2'b00; wire forced_scandoubler = 1'b0;
@@ -563,6 +600,56 @@ module clean_disp_tb;
             while (cmd_switchres) @(posedge clk_sys);
         end
     endtask
+
+    // /58 reconnect repro: mirrors what a REAL reconnect does to the core -- setInit()'s forced
+    // cmd_init edge (the /87 fix) plus a CmdSwitchres replay (api/groovymister.cpp:987, sent by
+    // every reconnect when a modeline was already established). Both independently assert
+    // eng_abort_r in the extracted FSM (Groovy.sv:949-950: `!cmd_init || reset_switchres`).
+    reg        reconnect_active = 0;
+    integer    trace_window_start = -1;
+    reg        trace_window_active = 0;
+    task do_reconnect;
+        begin
+            reconnect_active = 1;
+            $display("[RECONNECT] cmd_init -> 0 @cyc=%0d", cycles);
+            cmd_init = 1'b0;
+            repeat (RECONNECT_LOWCYC) @(posedge clk_sys);
+            cmd_init = 1'b1;
+            $display("[RECONNECT] cmd_init -> 1 @cyc=%0d", cycles);
+            trace_window_start  = cycles;
+            trace_window_active = 1;
+            repeat (50) @(posedge clk_sys);
+            if (PLL_GLITCH_NS > 0) begin
+                $display("[RECONNECT] PLL glitch: freezing clk_sys for %0dns starting @cyc=%0d", PLL_GLITCH_NS, cycles);
+                pll_glitch_active = 1'b1;
+                fork
+                    do_switchres;
+                    #(PLL_GLITCH_NS) pll_glitch_active = 1'b0;
+                join
+                $display("[RECONNECT] switchres replayed (through a %0dns clk_sys freeze) @cyc=%0d", PLL_GLITCH_NS, cycles);
+            end else begin
+                do_switchres;
+                $display("[RECONNECT] switchres replayed @cyc=%0d", cycles);
+            end
+            reconnect_active = 0;
+        end
+    endtask
+
+    // /58 reconnect DDR-contention trace: dumps on any CHANGE (FSM state, ddr_mux2 grant, engine
+    // state, wd_fired rising edge) for a bounded window after the simulated reconnect -- to see
+    // exactly what wins DDR arbitration while the engine's liveness watchdog fires. Edge-triggered
+    // (not per-cycle) to keep the log a readable size across a multi-million-cycle window.
+    reg [7:0] trc_fsm_d = 0; reg [1:0] trc_g_d = 0; reg [3:0] trc_eng_d = 0; reg trc_wdf_d = 0;
+    always @(posedge clk_sys) begin
+        trc_fsm_d <= state; trc_g_d <= ddr_mux.g; trc_eng_d <= eng_st_w; trc_wdf_d <= eng_wd_fired;
+        if (trace_window_active) begin
+            if (state != trc_fsm_d || ddr_mux.g != trc_g_d || eng_st_w != trc_eng_d || (eng_wd_fired && !trc_wdf_d))
+                $display("[RTRC %0d] fsm=%0d->%0d mux_g=%0d->%0d eng_st=%0d->%0d wd_fired=%0d pend=%0d wd=%0d busy=%0d ddr_req=%0d ddr_busy=%0d",
+                         cycles, trc_fsm_d, state, trc_g_d, ddr_mux.g, trc_eng_d, eng_st_w,
+                         eng_wd_fired, eng_pend_valid, u_eng.wd, eng_busy_w, ddr_data_req, ddr_busy);
+            if ((cycles - trace_window_start) > TRACE_WINDOW_CYC) trace_window_active = 0;
+        end
+    end
 
     // RAW: $fread the BYTE-EXACT nlc_synth marker_NNN.raw (the SAME generator hardware uses — no Verilog
     // re-implementation, so sim and HW show identical visuals) and write it to the FB, then blit. The marker
@@ -967,6 +1054,7 @@ module clean_disp_tb;
             end
             frnum = fi;
             if (CODEC == 0) feed_raw(frnum); else if (CODEC == 1) feed_lz4(frnum); else feed_nlc(frnum);
+            if (RECONNECT_AFTER > 0 && fi == RECONNECT_AFTER) do_reconnect;
         end
         if (WMRACE && wmrace_pend) begin write_word(DDR_LZ_HEADER, wmrace_hdr); wmrace_pend = 0; end   // let the LAST frame finalize
         repeat (framep*2) @(posedge clk_sys);
