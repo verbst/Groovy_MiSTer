@@ -4,15 +4,17 @@ This version adds new NLC compression, input support and stability improvements 
 The emulators below are validated with this version. Older emulators w/groovy are untested, and maybe have input issues. It is recommended to use the updated NLC versions.
 See releases for more details
 
-## General description
-This core is a analog GPU for CRTs aiming for very low subframe latency
-
-https://youtu.be/H0175WJFpUs
 ## This Fork's Features 
 - Lower network bandwidth requirements for a more stable playback experience (YCoCg-R & Rice to create NLC compression (Lossless & Near Lossless))
 - Connection stability fixes, reconnect and auto connection closing
 - Extended controller support (Full Dualshock w/Rumble)
 - Controller menu updates. Reassign a single button or swap profiles quickly within the new Controller MiSTer UI. Handy when swapping between different emulators.
+
+
+## General description
+This core is a analog GPU for CRTs aiming for very low subframe latency
+
+https://youtu.be/H0175WJFpUs
 
 ## Features 
 - Very low latency (~3ms tested with GILT on GroovyMAME with frame delay 8)
