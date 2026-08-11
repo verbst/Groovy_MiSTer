@@ -43,8 +43,7 @@ Thanks to @Shane for this great windows utility to mirror desktop.
 
 ### [Fightcade - FBNeo](https://github.com/verbst/fightcade-fbneo)
 
-### [Fightcade - Dojo Flycast]
-In progress
+### [Fightcade - Dojo Flycast](https://github.com/verbst/flycast-dojo)
 
 ### [PCSX2](https://github.com/verbst/pcsx2)
 Thanks to PCSX2 team.
@@ -55,6 +54,9 @@ Thanks to PCSX2 team.
 In progress
 
 ### [Retroarch]
+In progress
+
+### [Flycast (Non-Dojo)]
 In progress
 
 ## Thanks
