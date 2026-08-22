@@ -209,7 +209,7 @@ wire [1:0] scale = status[6:5];
 
 `include "build_id.v" 
 localparam CONF_STR = {
-   "Groovy;;",
+   "GroovyNLC;;",
    "-;",   
    "FC1,GMC,Load Gmc;",
    "-;",  
