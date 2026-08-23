@@ -43,31 +43,43 @@ BARS = (("R", (0xFA, 0x28, 0x28)),
         ("B", (0x32, 0x5A, 0xC8)))
 
 # ---- restyle knobs -------------------------------------------------------
-CIRCLE_RGB = (0x33, 0x20, 0x5A)   # deep violet, replaces the MiSTer navy
-TEXT_RGB   = (0xFF, 0xFF, 0xFF)   # drop to (0xC8,0xC8,0xD8) if it blooms on the CRT
-BAR_DST_Y0 = 9                    # bars are squashed into rows 9..40
-BAR_DST_H  = 32
-TEXT_Y0    = 43                   # wordmark occupies rows 43..53
+# The blue bar is the darkest of the three (Y=12.2%), which caps how bright the
+# disc fill can be: anything vivid enough to look like a brand colour drowns it.
+# So the fill goes near-black (bars get their best contrast of any option:
+# R 4.5 / G 9.8 / B 2.8) and the signature colour moves to a rim ring, where
+# nothing competes with it. Near-neutral, very slightly warm -- a blue-tinted
+# fill would undercut the one bar that needs the help.
+FILL_RGB   = (0x1C, 0x1A, 0x18)
+RING_RGB   = (0x0D, 0x80, 0x74)   # deep teal signature ring, Y=16.8%
+RING_W     = 3.0                  # px; 3 resists scanline-parity shimmer, 2 does not
+TEXT_RGB   = (0xD8, 0xC8, 0xA0)   # warm cream, Y=58% -- pure white at Y=100% strobed
+BAR_DST_Y0 = 8                    # bars are squashed into rows 8..37
+BAR_DST_H  = 30
+TEXT_Y0    = 41                   # wordmark occupies rows 41..51
 TEXT_GAP   = 3
+CENTRE     = 31.5                 # 64px disc
+RADIUS     = 32.0
 # Below this, a fitted bar term is disc-rim fringe noise rather than real bar
 # coverage. The rim strays top out at 0.09 and the faintest genuine bar edge is
 # 0.12, so 0.10 separates them cleanly; build() asserts nothing leaks past the
 # detected band, which is what would silently break if that ever stopped holding.
 BAR_EPS    = 0.10
 
-# 9x11 glyphs, 2px strokes -- only the three letters we need
+# 11x11 glyphs, 3px strokes. Widened from 2px: the sprite steps 2 px/frame
+# vertically, so every horizontal stroke changes scanline parity each frame --
+# 2px strokes strobe on a 15kHz CRT, 3px are far steadier.
 FONT = {
-    "N": ["XX.....XX", "XX.....XX", "XXX....XX", "XXXX...XX", "XX.XX..XX",
-          "XX..XX.XX", "XX...XXXX", "XX....XXX", "XX.....XX", "XX.....XX",
-          "XX.....XX"],
-    "L": ["XX.......", "XX.......", "XX.......", "XX.......", "XX.......",
-          "XX.......", "XX.......", "XX.......", "XX.......", "XXXXXXXXX",
-          "XXXXXXXXX"],
-    "C": ["..XXXXX..", ".XXXXXXX.", "XXX...XXX", "XX.....XX", "XX.......",
-          "XX.......", "XX.......", "XX.....XX", "XXX...XXX", ".XXXXXXX.",
-          "..XXXXX.."],
+    "N": ["XXX.....XXX", "XXX.....XXX", "XXXX....XXX", "XXXXX...XXX",
+          "XXXXXX..XXX", "XXX.XXX.XXX", "XXX..XXXXXX", "XXX...XXXXX",
+          "XXX....XXXX", "XXX.....XXX", "XXX.....XXX"],
+    "L": ["XXX........", "XXX........", "XXX........", "XXX........",
+          "XXX........", "XXX........", "XXX........", "XXX........",
+          "XXXXXXXXXXX", "XXXXXXXXXXX", "XXXXXXXXXXX"],
+    "C": ["..XXXXXXX..", ".XXXXXXXXX.", "XXX.....XXX", "XXX.....XXX",
+          "XXX........", "XXX........", "XXX........", "XXX.....XXX",
+          "XXX.....XXX", ".XXXXXXXXX.", "..XXXXXXX.."],
 }
-GW, GH = 9, 11
+GW, GH = 11, 11
 
 
 def read_header(path):
@@ -149,9 +161,9 @@ def build(selftest=False):
             resid[y][x] = r
 
     if selftest:
-        circle_rgb, squash, text = NAVY, False, False
+        circle_rgb, squash, text, ring = NAVY, False, False, False
     else:
-        circle_rgb, squash, text = CIRCLE_RGB, True, True
+        circle_rgb, squash, text, ring = FILL_RGB, True, True, True
 
     # ---- vertical squash of the bar layer --------------------------------
     # Find the band from rows that are solidly bar (>= 0.5), then take one more
@@ -204,6 +216,14 @@ def build(selftest=False):
             b = new_barc[y][x]
             a = max(0.0, disc[y][x] - b)
             px = [a * circle_rgb[i] for i in range(3)]
+            if ring:
+                # Ring alpha is the analytic rim band multiplied by the disc's
+                # own coverage, so the OUTER edge keeps the original artwork's
+                # anti-aliasing and the inner edge gets its own.
+                d = ((x - CENTRE) ** 2 + (y - CENTRE) ** 2) ** 0.5
+                ra = min(1.0, max(0.0, d - (RADIUS - RING_W) + 0.5)) * min(1.0, a)
+                if ra > 0:
+                    px = [px[i] * (1.0 - ra) + RING_RGB[i] * ra for i in range(3)]
             if b > 0:
                 bar = BARS[new_barid[y][x]][1]
                 px = [px[i] + b * bar[i] for i in range(3)]
@@ -229,6 +249,11 @@ def build(selftest=False):
                     if c != "X":
                         continue
                     y, x = TEXT_Y0 + gy, ox + gx
+                    d = ((x - CENTRE) ** 2 + (y - CENTRE) ** 2) ** 0.5
+                    assert d <= RADIUS - RING_W, (
+                        "wordmark pixel (%d,%d) d=%.2f runs into the ring band "
+                        "(inner %.2f) -- move TEXT_Y0 or narrow the glyphs"
+                        % (x, y, d, RADIUS - RING_W))
                     # disc[] is deliberately unclamped upstream, so clamp it
                     # here before using it as an alpha.
                     cov = min(1.0, max(0.0, disc[y][x]))   # never spill past the rim
@@ -236,6 +261,17 @@ def build(selftest=False):
                         continue
                     out[y][x] = [out[y][x][k] * (1.0 - cov) + TEXT_RGB[k] * cov
                                  for k in range(3)]
+
+    if ring:
+        # Bars and wordmark must stay clear of the ring band, or the mark reads
+        # as a smear at the rim instead of a clean outline.
+        inner = RADIUS - RING_W
+        for y in range(H):
+            for x in range(W):
+                d = ((x - CENTRE) ** 2 + (y - CENTRE) ** 2) ** 0.5
+                if d > inner:
+                    assert new_barc[y][x] == 0.0, \
+                        "bar pixel at (%d,%d) d=%.2f overlaps the ring (inner %.2f)" % (x, y, d, inner)
 
     return [tuple(int(round(min(255.0, max(0.0, v)))) for v in out[y][x])
             for y in range(H) for x in range(W)]
@@ -267,21 +303,15 @@ def emit(path, px, eol="\n"):
 
 
 def ascii_art(px):
+    """Classify each pixel by nearest palette entry rather than ad-hoc channel
+    thresholds -- the latter silently mislabels every time the palette moves."""
+    ref = [(" ", (0, 0, 0)), (".", FILL_RGB), ("O", RING_RGB), ("W", TEXT_RGB),
+           ("R", BARS[0][1]), ("G", BARS[1][1]), ("B", BARS[2][1])]
+
     def ch(p):
-        r, g, b = p
-        if (r, g, b) == (0, 0, 0):
-            return " "
-        if r > 200 and g > 200 and b > 200:
-            return "W"
-        if r > 140 and g < 100:
-            return "R"
-        if g > 140:
-            return "G"
-        if b > 140 and r < 100:
-            return "B"
-        return "o"
+        return min(ref, key=lambda t: sum((p[i] - t[1][i]) ** 2 for i in range(3)))[0]
     return "\n".join("|" + "".join(ch(px[y * W + x]) for x in range(W)) + "|"
-                     for y in range(H))
+                      for y in range(H))
 
 
 def main():
@@ -313,8 +343,9 @@ def main():
     present = set(px)
     for name, bar in BARS:
         assert bar in present, "bar colour %s %r vanished" % (name, bar)
-    assert CIRCLE_RGB in present, "circle colour %r missing" % (CIRCLE_RGB,)
+    assert FILL_RGB in present, "fill colour %r missing" % (FILL_RGB,)
     assert TEXT_RGB in present, "wordmark colour %r missing" % (TEXT_RGB,)
+    assert RING_RGB in present, "ring colour %r missing" % (RING_RGB,)
 
     emit(DST, px, eol)
     print(ascii_art(px))
