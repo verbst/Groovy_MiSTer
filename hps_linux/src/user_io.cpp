@@ -1459,9 +1459,32 @@ void user_io_init(const char *path, const char *xml)
 					printf("Found config:\n");
 					hexdump(cur_status, sizeof(cur_status));
 				}
+				// The core name keys this filename, so the Groovy->GroovyNLC rename orphaned
+				// every existing install's settings. A miss here zeroes the status word, and
+				// Audio/Joysticks/PS2/Verbose all list their DISABLED value first - so the core
+				// comes up mute, deaf to controllers and silent in the log while video (gated by
+				// no status bit) keeps working. Adopt the legacy file instead; the next OSD save
+				// writes it back under the new name.
+				else if (is_groovy() && strcasecmp(name, (LEGACY_GROOVY_CORE ".CFG"))
+				         && FileLoadConfig((LEGACY_GROOVY_CORE ".CFG"), cur_status, sizeof(cur_status)))
+				{
+					printf("Adopted legacy config %s (will save as %s):\n", (LEGACY_GROOVY_CORE ".CFG"), name);
+					hexdump(cur_status, sizeof(cur_status));
+				}
 				else
 				{
 					memset(cur_status, 0, sizeof(cur_status));
+					if (is_groovy())
+					{
+						// Genuinely fresh install: seed the options whose zero-value is
+						// disabling, so the core is usable before anyone opens the OSD.
+						// Bits are an INDEX into the CONF_STR value list, so these must match
+						// Groovy.sv - [34] Audio{Off,On}, [41:40] Joysticks{Off,Digital,Analog}.
+						// Idle timeout, PS2 and Verbose are deliberately left at their defaults.
+						printf("No config found, seeding Groovy defaults: Audio=On Joysticks=Analog\n");
+						user_io_status_set("[34]", 1);
+						user_io_status_set("[41:40]", 2);
+					}
 				}
 
 				user_io_status_set("[0]", 1);

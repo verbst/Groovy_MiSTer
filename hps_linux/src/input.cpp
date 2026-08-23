@@ -1500,15 +1500,32 @@ static char *get_unique_mapping(int dev, int force_unique = 0)
 	return str;
 }
 
-static char *get_map_name(int dev, int def)
+static char *get_map_name_for(int dev, int def, const char *core)
 {
 	static char name[1024];
 	char *id = get_unique_mapping(dev);
 
 	if (def || is_menu()) sprintfz(name, "input_%s%s_v3.map", id, input[dev].mod ? "_m" : "");
-	else if (is_groovy() && input[dev].profile > 0) sprintfz(name, "%s_input_%s%s_p%d_v3.map", user_io_get_core_name(), id, input[dev].mod ? "_m" : "", input[dev].profile);
-	else sprintfz(name, "%s_input_%s%s_v3.map", user_io_get_core_name(), id, input[dev].mod ? "_m" : "");
+	else if (is_groovy() && input[dev].profile > 0) sprintfz(name, "%s_input_%s%s_p%d_v3.map", core, id, input[dev].mod ? "_m" : "", input[dev].profile);
+	else sprintfz(name, "%s_input_%s%s_v3.map", core, id, input[dev].mod ? "_m" : "");
 	return name;
+}
+
+static char *get_map_name(int dev, int def)
+{
+	return get_map_name_for(dev, def, user_io_get_core_name());
+}
+
+// Read a per-core map, falling back to the pre-rename "Groovy" filename. Without this the
+// GroovyNLC rename leaves every pad unmapped - and worst of all for a pad whose surviving
+// inputs/<id>_groovy.cfg sidecar carries profile=N, because get_map_name() then asks for a
+// _pN_ file that cannot exist yet. Saves keep using the current name (see save_map), so the
+// next button define migrates the file across.
+static int load_map_core(int dev, int def, void *pBuffer, int size)
+{
+	if (load_map(get_map_name_for(dev, def, user_io_get_core_name()), pBuffer, size)) return 1;
+	if (!is_groovy() || !strcasecmp(user_io_get_core_name(), LEGACY_GROOVY_CORE)) return 0;
+	return load_map(get_map_name_for(dev, def, LEGACY_GROOVY_CORE), pBuffer, size);
 }
 
 // ---- groovy per-device config (sidecar) ---------------------------------------------
@@ -1691,12 +1708,25 @@ char *groovy_dev_name(int dev)
 }
 
 
-static char *get_jkmap_name(int dev)
+static char *get_jkmap_name_for(int dev, const char *core)
 {
 	static char name[1024];
 	char *id = get_unique_mapping(dev);
-	sprintfz(name, "%s_input_%s_jk.map", user_io_get_core_name(), id);
+	sprintfz(name, "%s_input_%s_jk.map", core, id);
 	return name;
+}
+
+static char *get_jkmap_name(int dev)
+{
+	return get_jkmap_name_for(dev, user_io_get_core_name());
+}
+
+// Legacy-name fallback, as load_map_core() above.
+static int load_jkmap_core(int dev, void *pBuffer, int size)
+{
+	if (load_map(get_jkmap_name_for(dev, user_io_get_core_name()), pBuffer, size)) return 1;
+	if (!is_groovy() || !strcasecmp(user_io_get_core_name(), LEGACY_GROOVY_CORE)) return 0;
+	return load_map(get_jkmap_name_for(dev, LEGACY_GROOVY_CORE), pBuffer, size);
 }
 
 static char *get_kbdmap_name(int dev)
@@ -2880,7 +2910,7 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 			memset(input[dev].map, 0, sizeof(input[dev].map));
 			input[dev].map[map_paddle_btn()] = 0x120;
 		}
-		else if (!load_map(get_map_name(dev, 0), &input[dev].map, sizeof(input[dev].map)))
+		else if (!load_map_core(dev, 0, &input[dev].map, sizeof(input[dev].map)))
 		{
 			memset(input[dev].map, 0, sizeof(input[dev].map));
 			if (!is_menu())
@@ -2912,7 +2942,7 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 
 	if (!input[dev].has_jkmap)
 	{
-		if (!load_map(get_jkmap_name(dev), &input[dev].jkmap, sizeof(input[dev].jkmap)))
+		if (!load_jkmap_core(dev, &input[dev].jkmap, sizeof(input[dev].jkmap)))
 		{
 			memset(input[dev].jkmap, 0, sizeof(input[dev].jkmap));
 		}

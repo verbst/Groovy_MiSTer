@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <cstring>
+#include <errno.h>
 
 /* UDP server */
 #include <sys/socket.h>
@@ -137,6 +138,8 @@ static constexpr auto IDLE_TIMEOUT_OPT = "[8:7]";
 
 //https://stackoverflow.com/questions/64318331/how-to-print-logs-on-both-console-and-file-in-c-language
 #define LOG_TIMER 25
+#define VERBOSE_POLL_TIMER 250   // ms between OSD Verbose re-reads (see groovy_poll)
+#define GROOVY_LOG_PATH "/tmp/groovynlc.log"
 #define LOGO_TIMER 16
 #define KEEP_ALIVE_FRAMES 45 * 60
 
@@ -144,11 +147,12 @@ static struct timespec logTS, logTS_ant, blitStart, blitStop;
 static int doVerbose = 0;
 static double difMs = 0;
 static unsigned long logTime = 0;
+static unsigned long verboseTime = 0;
 static FILE * fp = NULL;
 
 #define LOG(sev,fmt, ...) do {	\
 			        if (sev == 0) printf(fmt, __VA_ARGS__);	\
-			        if (sev <= doVerbose) { \
+			        if (fp && sev <= doVerbose) { \
 			        	clock_gettime(CLOCK_MONOTONIC, &logTS); \
 			        	difMs = (difMs != 0) ? diff_in_ms(&logTS_ant, &logTS) : -1; \
 					fprintf(fp, "[%06.3f]", difMs); \
@@ -490,10 +494,13 @@ static void initVerboseFile()
 	// evidence needed to diagnose it. Only the first call (process startup, or the first CMD_INIT
 	// if verbose was toggled on after boot) actually creates/truncates the file.
 	if (fp) return;
-	fp = fopen("/tmp/groovy.log", "wt");
+	fp = fopen(GROOVY_LOG_PATH, "wt");
 	if (!fp)
 	{
-		LOG(0, "groovy.log %s\n", "error");
+		// Must not LOG() here - LOG writes to fp, and every path below this point
+		// (fstat(fileno(fp)), setvbuf) would dereference NULL too.
+		printf("%s open error: %s\n", GROOVY_LOG_PATH, strerror(errno));
+		return;
 	}
 	struct stat stats;
     	if (fstat(fileno(fp), &stats) == -1)
@@ -2783,6 +2790,16 @@ void groovy_poll()
 		return;
 	}
 
+	// Verbose is the one OSD option honoured live. The rest stay latched at server start
+	// (the "Save and reload to apply!" line in CONF_STR) because they gate socket creation,
+	// but logging has to be switchable while a fault is actually happening. Rate-limited
+	// because user_io_status_get() sscanf()s the bit spec, and this loop is hot.
+	if (CheckTimer(verboseTime))
+	{
+		doVerbose = (int) user_io_status_get(VERBOSE_OPT);
+		verboseTime = GetTimer(VERBOSE_POLL_TIMER);
+	}
+
 	// client->server traffic on the inputs socket, one non-blocking sweep per
 	// poll. Address-aware: len==1 is an input (re)subscribe — refresh the
 	// stored client address so the joystick/ps2 stream always follows the
@@ -2933,7 +2950,7 @@ void groovy_poll()
 		}
 	}
 
-	if (doVerbose > 0 && CheckTimer(logTime))
+	if (fp && doVerbose > 0 && CheckTimer(logTime))
    	{
 		fflush(fp);
 		logTime = GetTimer(LOG_TIMER);
