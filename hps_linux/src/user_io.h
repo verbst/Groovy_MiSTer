@@ -287,6 +287,12 @@ char is_n64();
 char is_uneon();
 char is_groovy();
 
+// The name this core carried before the Groovy->GroovyNLC rename. The core name keys the
+// OSD settings file and the input maps, so existing installs would silently come up with a
+// zeroed status word (audio muted, inputs off) and unmapped pads. Reads fall back to this
+// name; writes always use the current one, so the first save/define migrates.
+#define LEGACY_GROOVY_CORE "Groovy"
+
 #define HomeDir(x) user_io_get_core_path(x)
 #define CoreName user_io_get_core_name()
 #define CoreName2 user_io_get_core_name2()
