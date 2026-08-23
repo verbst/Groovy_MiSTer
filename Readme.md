@@ -49,12 +49,11 @@ Thanks to @Shane for this great windows utility to mirror desktop.
 
 ### [PCSX2](https://github.com/verbst/pcsx2)
 Thanks to PCSX2 team.
+- Dualshock input support w/Rumble (Use Analog Setting)
 
-- Dualshock input support w/Rumble
-
-### [RPCS3]
-In progress
-
+### [RPCS3](https://github.com/verbst/rpcs3)
+- Dualshock input support w/Rumble (Use Analog Setting)
+  
 ### [Retroarch]
 In progress
 
