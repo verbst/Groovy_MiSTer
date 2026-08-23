@@ -353,7 +353,11 @@ char is_uneon()
 static int is_groovy_type = 0;
 char is_groovy()
 {
-	if (!is_groovy_type) is_groovy_type = strcasecmp(orig_name, "Groovy") ? 2 : 1;
+	// Prefix match: covers both the stock "Groovy" core and this fork's
+	// "GroovyNLC" (Groovy.sv CONF_STR field 0). Gates ~22 call sites across
+	// user_io.cpp/input.cpp/menu.cpp, so an exact compare here would boot
+	// fine and silently drop every fork feature.
+	if (!is_groovy_type) is_groovy_type = strncasecmp(orig_name, "Groovy", 6) ? 2 : 1;
 	return (is_groovy_type == 1);
 }
 
