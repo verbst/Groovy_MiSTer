@@ -5,7 +5,19 @@ The emulators below are validated with this version. Older emulators w/groovy ar
 See releases for more details
 
 ## This Fork's Features 
-- Lower network bandwidth requirements for a more stable playback experience (YCoCg-R & Rice to create NLC compression (Lossless & Near Lossless))
+- Much lower network bandwidth requirements for a more stable playback experience (YCoCg-R & Rice to create NLC compression (Lossless & Near Lossless)). 480p works great.
+
+```
+codec                 meanRatio worstRatio     meanMbps     peakMbps      encMs   encMsMax
+-----                 --------- ----------     --------     --------      -----   --------
+raw                        1.00       1.00        497.7        497.7       0.00       0.00
+lz4+sub                    1.34       1.34        371.1        372.5       2.14       3.03
+lz4hc+sub                  1.58       1.57        314.9        317.6      35.10      36.68
+nlc rice  ycc  n0          1.80       1.78        276.0        280.2       5.50       5.95
+nlc rice  ycc  n1          2.50       2.45        199.0        202.8       5.94       6.41
+nlc rice  ycc  n2          2.95       2.89        168.7        171.9       5.78       5.99
+```
+
 - Connection stability fixes, reconnect and auto connection closing
 - Extended controller support (Full Dualshock w/Rumble)
 - Controller menu updates. Reassign a single button or swap profiles quickly within the new Controller MiSTer UI. Handy when swapping between different emulators.
