@@ -20,8 +20,8 @@ GroovyMister* gmw;
 int gmw_inputsBinded;
 
 // The pre-init setters (caps, NLC knobs, auto-reconnect, log level) must work
-// before gmw_init/gmw_bindInputs have created the singleton — create it on
-// demand so call ordering never matters.
+// before gmw_init/gmw_bindInputs have created the singleton, so it is created
+// on demand and call ordering never matters.
 static GroovyMister* gmw_instance(void)
 {
 	if (gmw == NULL)
@@ -84,16 +84,14 @@ MODULE_API_GMW uint32_t gmw_reconnect_epoch(void)
 	return (gmw != NULL) ? gmw->reconnectEpoch() : 0;
 }
 
-MODULE_API_GMW void gmw_switchres(double pClock, uint16_t hActive, uint16_t hBegin, uint16_t hEnd, uint16_t hTotal, uint16_t vActive, uint16_t vBegin, uint16_t vEnd, uint16_t vTotal, uint8_t interlace)
+MODULE_API_GMW int gmw_switchres(double pClock, uint16_t hActive, uint16_t hBegin, uint16_t hEnd, uint16_t hTotal, uint16_t vActive, uint16_t vBegin, uint16_t vEnd, uint16_t vTotal, uint8_t interlace)
 {
 	if (gmw != NULL)
 	{
-		gmw->CmdSwitchres(pClock, hActive, hBegin, hEnd, hTotal, vActive, vBegin, vEnd, vTotal, interlace);
+		return gmw->CmdSwitchres(pClock, hActive, hBegin, hEnd, hTotal, vActive, vBegin, vEnd, vTotal, interlace);
 	}
-	else
-	{
-		printf("[MiSTer] gmw_switchres failed\n");
-	}
+	printf("[MiSTer] gmw_switchres failed\n");
+	return -1;
 }
 
 MODULE_API_GMW char* gmw_get_pBufferBlit(uint8_t field)
@@ -252,8 +250,8 @@ MODULE_API_GMW uint8_t gmw_get_input_caps(void)
 	return (gmw != NULL) ? gmw->getInputCaps() : 0;
 }
 
-// Internally guarded (connected + inputs bound + GMW_CAP_RUMBLE negotiated) —
-// deliberately quiet otherwise: the pad layer may push motor state at any time.
+// Internally guarded (connected, inputs bound, GMW_CAP_RUMBLE negotiated) and
+// deliberately quiet otherwise, since the pad layer may push motor state at any time.
 MODULE_API_GMW void gmw_send_rumble(uint8_t player, uint8_t strong, uint8_t weak)
 {
 	if (gmw != NULL)
@@ -378,6 +376,39 @@ MODULE_API_GMW void gmw_set_nlc_disp_mode(uint8_t mode)
 MODULE_API_GMW void gmw_set_auto_reconnect(uint8_t on)
 {
 	gmw_instance()->setAutoReconnect(on);
+}
+
+// NLC pre-encode fast path. See the ordering contract in groovymister_wrapper.h.
+MODULE_API_GMW char* gmw_get_pBufferPreEncoded(void)
+{
+	if (gmw != NULL)
+	{
+		return gmw->getPBufferPreEncoded();
+	}
+	printf("[MiSTer] gmw_get_pBufferPreEncoded failed\n");
+	return NULL;
+}
+
+MODULE_API_GMW void gmw_set_pre_encoded_size(uint32_t cSize)
+{
+	if (gmw != NULL)
+	{
+		gmw->setPreEncodedSize(cSize);
+	}
+	else
+	{
+		printf("[MiSTer] gmw_set_pre_encoded_size failed\n");
+	}
+}
+
+MODULE_API_GMW uint32_t gmw_encode_nlc(const char* rgbFrame, char* out)
+{
+	if (gmw != NULL)
+	{
+		return gmw->EncodeNLC(rgbFrame, out);
+	}
+	printf("[MiSTer] gmw_encode_nlc failed\n");
+	return 0;
 }
 
 

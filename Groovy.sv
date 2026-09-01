@@ -343,25 +343,29 @@ wire lz4_delta;
 wire [31:0] lz4_size, switchres_frame;
 wire [1:0] codec_mode, nlc_near;   // codec_mode: 0=raw 1=LZ4 2=NLC (from hps_ext init word)
 wire nlc_color;
-wire [1:0] nlc_disp_mode;          // /46 NLC display path: 0=/45 stream, 1=B-throttle, 2=B-autonomous (init word [7:6])
-wire nlc_rice;                     // R3: NLC entropy pack: 1=Golomb-Rice, 0=TILED (init word [8])
+wire [1:0] nlc_disp_mode;          // NLC display path: 0=streaming, 1=throttled (retired), 2=autonomous (init word [7:6])
+wire nlc_rice;                     // NLC entropy pack: 1=Golomb-Rice, 0=TILED (init word [8])
 
-// ---- /55 wedge telemetry (declared here so hps_ext/ddr_mux2/ddram ports see real nets;
-// composed + driven at the bottom of the module, next to the engine instance).
-// /56 LESSON: the first cut fed hps_ext with COMBINATIONAL concatenations of regs spread
-// across the whole die (ddram / mux / engine / FSM) — the build lost timing closure
-// (worst setup -0.563 vs the working /52 kit's +0.105) and the silicon showed data
-// corruption with healthy control flow (black screen). ALL telemetry is now aggregated
-// through PIPELINE REGISTERS (dbg_*_r): telemetry tolerates 1-2 cycles of staleness,
-// and each cross-module route gets its own full clock period. ----
+// ---- wedge telemetry (declared here so hps_ext/ddr_mux2/ddram ports see real nets;
+// composed and driven at the bottom of the module, next to the engine instance).
+// These must stay pipelined. Feeding hps_ext combinational concatenations of registers spread
+// across the whole die (ddram, mux, engine, FSM) costs the build its timing closure, and the
+// silicon then shows data corruption with healthy control flow, which presents as a black
+// screen. All telemetry is therefore aggregated through the dbg_*_r pipeline registers:
+// telemetry tolerates one or two cycles of staleness, and each cross-module route gets its own
+// full clock period. ----
 wire [1:0]  dbg_mux_grant;                  // ddr_mux2 grant state (G_M0/G_PEND/G_M1/G_DRAIN)
 wire [2:0]  dbg_ddram_state;                // {read_req, ddram state[1:0]}
 wire [3:0]  dbg_ddr_timeout_cnt;            // ddram read-watchdog fires (saturating)
 reg  [15:0] dbg_live_a_r = 16'd0, dbg_live_b_r = 16'd0;   // pipelined words 10/11
 reg  [15:0] dbg_w12_r = 16'd0, dbg_w13_r = 16'd0;         // words 12/13 (frz latch or live eng info)
 reg  [15:0] dbg_frz_a = 16'd0, dbg_frz_b = 16'd0;         // first-freeze latch
-reg  [3:0]  dbg_wd_cnt = 4'd0, dbg_syncloss_cnt = 4'd0;
-reg  [3:0]  dbg_done_cnt = 4'd0;            // /56: ROLLING count of engine done_stb (publish rate!)
+reg  [3:0]  dbg_wd_cnt = 4'd0;
+reg  [7:0]  dbg_syncloss_cnt = 8'd0;      // 4 bits saturate seconds into a fault; 8 covers a whole session
+reg  [15:0] dbg_w14_r = 16'd0;            // word 14: longest starved-pixel run
+reg  [15:0] dbg_starve_frm = 16'd0, dbg_starve_max = 16'd0;
+reg         dbg_starve_r = 1'b0;          // pipeline stage 1 for the vga.v starve strobe
+reg  [3:0]  dbg_done_cnt = 4'd0;            // rolling count of engine done_stb (shows the publish rate)
 reg         dbg_freeze_valid = 1'b0;        // the latch holds a captured freeze
 reg         dbg_freeze_hit = 1'b0;          // 1-cycle pulse -> FSM liveness net (vram_reset)
 reg  [1:0]  dbg_freeze_frames = 2'd0;
@@ -418,7 +422,8 @@ hps_ext hps_ext
         .dbg_live_a(dbg_live_a_r),
         .dbg_live_b(dbg_live_b_r),
         .dbg_frz_a(dbg_w12_r),
-        .dbg_frz_b(dbg_w13_r)
+        .dbg_frz_b(dbg_w13_r),
+        .dbg_w14(dbg_w14_r)
 /* debug
         .PoC_subframe_wr_bytes(PoC_subframe_wr_bytes),                    
         .lz4_run(lz4_run),     
@@ -576,14 +581,14 @@ reg[1:0]     ddr_data_idx = 2'd0;
 reg  [63:0]  ddr_data_to_write={8'h00,8'h00,8'h00,8'h00,8'h00,8'h73,8'h65,8'h72};
 
 
-// /47 NLC Mode 2: two-master DDR arbiter — M0 = this blit FSM (bit-transparent, priority),
-// M1 = the autonomous NLC decode engine (idle in modes 0/1). Grant contract in rtl/ddr_mux2.v.
+// NLC mode 2: two-master DDR arbiter. M0 is this blit FSM (bit-transparent, priority),
+// M1 is the autonomous NLC decode engine (idle in modes 0 and 1). Grant contract in rtl/ddr_mux2.v.
 wire [27:1] ddrm_addr;
 wire [63:0] ddrm_din;
 wire        ddrm_rd, ddrm_wr;
 wire [7:0]  ddrm_burst;
 wire        ddrm_busy, ddrm_dready;
-// engine master port (driven by u_eng, the /47 mode-2 autonomous decode engine — see below)
+// engine master port (driven by u_eng, the mode-2 autonomous decode engine, instantiated below)
 wire        eng_req;
 wire        eng_gnt;
 wire [27:1] eng_addr;
@@ -774,6 +779,13 @@ parameter S_Blit_Copy_Raw         = 8'd23;
 parameter S_Blit_End_Raw          = 8'd24; 
 
 // FrameSkip (non Volatile)
+// Lines of VRAM the auto-blit keeps ahead of the beam. This was one line while the auto-blit was
+// only the frameskip repeater, a fallback path where a shallow lead cost nothing. NLC mode 2 made
+// it the primary display path, and one line is about 30us of slack against a FIFO that holds 153
+// lines at 640 wide, so any DDR stall longer than a line time starves the beam and paints a red
+// line. Reading further ahead costs no latency: the framebuffer content already exists, and the
+// beam still decides when it is shown.
+parameter [23:0] AUTOBLIT_LEAD    = 24'd16;
 parameter S_Blit_Auto_Skip        = 8'd26; 
 parameter S_Blit_Auto_First       = 8'd27; 
 parameter S_Blit_Auto_Line        = 8'd28; 
@@ -794,7 +806,7 @@ parameter S_Blit_Copy_End_Lz4     = 8'd54;
 parameter S_Blit_Inflate_Lz4      = 8'd55;
 parameter S_Blit_End_Lz4          = 8'd56;
 
-// NLC (block-adaptive near-lossless) blit — dedicated FB-only path, codec_mode==2. 8'd80-85
+// NLC (block-adaptive near-lossless) blit: dedicated FB-only path, codec_mode==2. 8'd80-85
 parameter S_Blit_Header_NLC       = 8'd80;
 parameter S_Blit_Setup_NLC        = 8'd81;
 parameter S_Blit_Prepare_NLC      = 8'd82;
@@ -802,7 +814,7 @@ parameter S_Blit_Copy_NLC         = 8'd83;
 parameter S_Blit_Inflate_NLC      = 8'd84;
 parameter S_Blit_End_NLC          = 8'd85;
 parameter S_Blit_Flush_NLC        = 8'd86;   // STAGE 1: burst-write the accumulated line chunk to the FB
-parameter S_Blit_Present_NLC      = 8'd87;   // /47 mode 2: engine-completed frame in the FB -> RAW-style blit
+parameter S_Blit_Present_NLC      = 8'd87;   // mode 2: engine-completed frame in the FB -> RAW-style blit
 
 // LZ4 Blit_Delta
 parameter S_Delta_Prepare         = 8'd60; 
@@ -906,16 +918,16 @@ always @(posedge clk_sys) begin
   
   // verify if vram has pixels needed for next line to activate non volatile framebuffer (cmd_fskip)   
   if ((hps_frameskip || cmd_logo) && PoC_frame_vram != 0) begin      
-      if (vga_vcount <= PoC_interlaced && vram_queue == 24'd0) begin // raster at the end of frame and vram is empty
+      if (vga_vcount <= PoC_interlaced && (vram_queue == 24'd0 || !vram_synced)) begin // frame end: vram empty, or a deferred starve to flush
         cmd_fskip             <= 1'b1;          
         PoC_state_frameskip   <= S_Blit_Auto_First;     
       end else
       if (!vblank_core) begin
-        if (vga_vcount + 1 + PoC_interlaced >= PoC_V && PoC_H > vram_queue && vram_queue + 20 < vram_pixels && vga_pixels > vram_pixels && vram_pixels > (PoC_H << 2)) begin // last line interlaced
+        if (vga_vcount + AUTOBLIT_LEAD + PoC_interlaced >= PoC_V && (PoC_H * AUTOBLIT_LEAD) > vram_queue && vram_queue + 20 < vram_pixels && vga_pixels > vram_pixels && vram_pixels > (PoC_H << 2)) begin // last lines interlaced
             cmd_fskip           <= 1'b1;     
             PoC_state_frameskip <= S_Blit_Auto_End;
         end else
-        if (vga_vcount + 1 + PoC_interlaced < PoC_V && PoC_H > vram_queue && vram_queue + 20 < vram_pixels && ((PoC_H * (vga_vcount + 10'd1 + PoC_interlaced)) >> PoC_FB_interlaced) > vram_pixels) begin // next line
+        if (vga_vcount + AUTOBLIT_LEAD + PoC_interlaced < PoC_V && (PoC_H * AUTOBLIT_LEAD) > vram_queue && vram_queue + 20 < vram_pixels && ((PoC_H * (vga_vcount + AUTOBLIT_LEAD + PoC_interlaced)) >> PoC_FB_interlaced) > vram_pixels) begin // next lines
             cmd_fskip           <= 1'b1;                 
             PoC_state_frameskip <= S_Blit_Auto_Line;
         end 
@@ -923,24 +935,24 @@ always @(posedge clk_sys) begin
     end 
        
 
-  // /47 MODE-2 ENGINE HANDSHAKE SERVICE (every cycle, state-independent). The engine runs the
-  // decode in the background; this block just ferries announces/completions between it and the
-  // FSM. NOTE: later same-cycle writes in the case body override these defaults (Verilog last-
-  // assignment-wins) — exactly what the newest-wins pend policy wants.
+  // Mode-2 engine handshake service (every cycle, state-independent). The engine runs the
+  // decode in the background; this block just ferries announces and completions between it and
+  // the FSM. Later same-cycle writes in the case body override these defaults, since Verilog is
+  // last-assignment-wins, which is exactly what the newest-wins pend policy wants.
   eng_wm_stb <= 1'b0;
   if (eng_adopt_ack) eng_pend_valid <= 1'b0;
   if (eng_done_stb) begin
     // host-space status (WaitSync/GET_STATUS pacing) advances on every completion
     if (eng_cur_frame > PoC_frame_lz4) PoC_frame_lz4 <= eng_cur_frame;
     // present-blit only to BOOTSTRAP the raster (frame 1 / post-switchres re-lock): once the
-    // display runs, the frameskip auto-blit shows the FB continuously (the proven /37
-    // architecture — the mode-2 smoke run displayed 11/12 frames via repeats alone). A
-    // per-frame VRAM present would fight the repeats for VRAM (the /42 mid-scan bands).
+    // display runs, the frameskip auto-blit shows the FB continuously, which is the established
+    // architecture: a mode-2 run displays 11 frames in 12 through repeats alone. A per-frame VRAM
+    // present would fight those repeats for VRAM and produce the mid-scan band artefact.
     if (PoC_frame_vram == 24'd0 || vga_soft_reset) nlc_present_pending <= 1'b1;
     nlc_present_frame   <= eng_cur_frame;
   end
-  // keep-alive: while the engine decodes, keep the dispatcher re-reading the announce header —
-  // same-frame chunk growth + the 65535 sentinel arrive as header REWRITES with no new cmd
+  // keep-alive: while the engine decodes, keep the dispatcher re-reading the announce header.
+  // Same-frame chunk growth and the 65535 sentinel arrive as header rewrites with no new cmd
   // pulse. Must live HERE (continuous), not in the Header visit: at the first visit the engine
   // has not adopted yet (busy=0), which latched the keep-alive off and starved multi-chunk
   // frames at exactly one chunk (the 480i wedge). Mode-0/1 states override this default below.
@@ -1065,7 +1077,7 @@ always @(posedge clk_sys) begin
                state                 <= S_Blit_Auto_Skip;
              end else
              if (codec_mode == 2'd2 && nlc_disp_mode == 2'd2 && (nlc_present_pending || nlc_present_active) && !vga_frameskip) begin
-               // /47 mode 2: an engine-completed NLC frame sits in the FB — present it (RAW-style)
+               // mode 2: an engine-completed NLC frame sits in the FB, so present it RAW-style
                state                 <= S_Blit_Present_NLC;
              end else
              if ((cmd_blit || auto_blit) && !vga_frameskip) begin // pixels blit if fskip isn't activated
@@ -1190,16 +1202,16 @@ always @(posedge clk_sys) begin
              vga_wait_vblank         <= 1'b0;
              vram_drive_raw          <= 1'b0;
              vram_reset              <= !vram_synced || PoC_subframe_px_vram != vga_pixels ? 1'b1 : 1'b0;   //vram_pixels not yet updated to compare!
-             if (codec_mode == 2'd2) nlc_present_active <= 1'b0;   // /47 mode 2: the present-blit completed
+             if (codec_mode == 2'd2) nlc_present_active <= 1'b0;   // mode 2: the present-blit completed
              state                   <= S_Dispatcher;
            end else state            <= cmd_audio ? S_Dispatcher : S_Blit_Prepare_Raw;
          end
 
          S_Blit_Auto_Skip:  // calculate pixels to get next line
          begin                                                               
-           if (PoC_state_frameskip == S_Blit_Auto_First) PoC_px_frameskip <= (PoC_H << PoC_interlaced) + 24'd3;
+           if (PoC_state_frameskip == S_Blit_Auto_First) PoC_px_frameskip <= ((PoC_H * AUTOBLIT_LEAD) << PoC_interlaced) + 24'd3;
            else if (PoC_state_frameskip == S_Blit_Auto_End) PoC_px_frameskip <= vga_pixels;
-                else PoC_px_frameskip <= ((PoC_H * (vga_vcount + 10'd1 + PoC_interlaced)) >> PoC_FB_interlaced) + 24'd3;                               
+                else PoC_px_frameskip <= ((PoC_H * (vga_vcount + AUTOBLIT_LEAD + PoC_interlaced)) >> PoC_FB_interlaced) + 24'd3;                               
            state <= PoC_state_frameskip == S_Blit_Auto_First ? S_Blit_Auto_First : S_Blit_Auto_Line;                                                                               
          end            
          
@@ -1597,7 +1609,7 @@ always @(posedge clk_sys) begin
          // CLEAN FB-only NLC: decode compressed (LZ zones) -> framebuffer, then the auto-blit displays it
          // (decode is slower than the beam, so it can never stream live). Mirrors the LZ4 blit states but
          // feeds/drains u_nlc. NO dbuf, NO watchdog, NO live-streaming-to-VRAM, NO delta. Reuses the LZ4
-         // bookkeeping (PoC_frame_lz4*/PoC_subframe_lz4_*, lz4_size/ABCD/field) — codecs are mutually exclusive.
+         // bookkeeping (PoC_frame_lz4*/PoC_subframe_lz4_*, lz4_size/ABCD/field), codecs being mutually exclusive.
          S_Blit_Header_NLC:  // header ready
          begin
            nlc_out_ready  <= 1'b0; nlc_write_long <= 1'b0;
@@ -1605,16 +1617,17 @@ always @(posedge clk_sys) begin
            reset_blit_lz4             <= 1'b0;
            vram_reset                 <= !vram_synced;
            // STREAMING (mirror LZ4): NLC decodes straight into the VRAM FIFO. Stream unless bootstrap/recover
-           // (FB-mode only when VRAM isn't synced or RAW owns it). The /39 freeze was NOT caused by streaming per
-           // se — it was the Inflate COMMIT being gated on vram_req_ready (a bootstrap deadlock); the fixed Inflate
-           // decouples commit (on long_valid) from advance (on vram_req_ready), exactly like LZ4, so streaming is
-           // robust. NLC decode 11.8 Mpix/s > 240p beam 6.9 -> it keeps the sub-frame FIFO fed with no FB round-trip.
-           // (NLC 480i needs FB-mode — streaming fills VRAM linearly but the interlaced scanout reads even/odd
-           // FIELDS — but that FB-mode + decode-completion rework is DEFERRED; NLC runs progressive-only for now.)
+           // (FB-mode only when VRAM isn't synced or RAW owns it). Streaming itself never caused the
+           // frozen-framebuffer stall: the cause was the Inflate commit being gated on vram_req_ready, which
+           // deadlocked at bootstrap. The fixed Inflate decouples commit (on long_valid) from advance (on
+           // vram_req_ready) exactly like LZ4, so streaming is robust. NLC decodes at 11.8 Mpix/s against a
+           // 240p beam at 6.9, so it keeps the sub-frame FIFO fed with no FB round-trip.
+           // NLC 480i still needs FB-mode, because streaming fills VRAM linearly while the interlaced scanout
+           // reads even and odd fields. That rework is deferred, so NLC runs progressive-only for now.
            PoC_frame_lz4_FB           <= (!vram_synced || vram_drive_raw) ? 1'b1 : 1'b0;
            if (ddr_data_ready) begin
              ddr_data_req             <= 1'b0;
-             // /47 MODE 2: hand the announce to the autonomous engine and return — the FSM never
+             // Mode 2: hand the announce to the autonomous engine and return; the FSM never
              // decodes. Same-frame chunk growth -> watermark strobe; new frame -> newest-wins pend.
              // The stale-vs-switchres gate mirrors the mode-0 idle-adopt gate below.
              if (nlc_disp_mode == 2'd2) begin
@@ -1658,19 +1671,19 @@ always @(posedge clk_sys) begin
                PoC_subframe_lz4_ddr_bytes <= ddr_data[47:24];
                PoC_subframe_blit_lz4_ddr  <= ddr_data[47:24] == nlc_compressed_bytes ? PoC_subframe_blit_lz4 + 1'b1 : ddr_data[63:48];
              end
-             end   // /47: close the mode-0/1 (non-engine) branch
+             end   // close the mode-0/1 (non-engine) branch
            end
          end
 
-         S_Blit_Present_NLC: // /47 mode 2: an engine-completed frame is in the FB — blit it exactly like RAW
+         S_Blit_Present_NLC: // mode 2: an engine-completed frame is in the FB, blit it exactly like RAW
          begin
            state <= S_Blit_Raw;
            if (nlc_present_pending) begin
              // START a fresh present. DISPLAY-space numbering, strictly ahead of both the raster
-             // frame and the last published frame (the /43 lesson: an equal frame# makes
-             // S_Blit_Raw's guard silently skip the blit). NO vram_reset / NO forced wait_vblank
-             // here — S_Blit_Raw primes itself when the queue is empty (the /45 60fps-truncation
-             // lesson: parking the raster every frame truncates the bottom).
+             // frame and the last published frame, because an equal frame number makes
+             // S_Blit_Raw's guard silently skip the blit. No vram_reset and no forced wait_vblank
+             // here: S_Blit_Raw primes itself when the queue is empty, and parking the raster
+             // every frame truncates the bottom of the picture.
              nlc_present_pending     <= 1'b0;
              nlc_present_active      <= 1'b1;
              PoC_frame_ddr           <= (PoC_frame_vram >= vga_frame ? PoC_frame_vram : vga_frame) + 1'b1;
@@ -1680,19 +1693,18 @@ always @(posedge clk_sys) begin
              PoC_subframe_bl_vram    <= 16'd0;
              PoC_subframe_vram_bytes <= 28'd0;
              PoC_frame_rgb_offset    <= 2'd0;
-             // NOTE (/47 glitch triage): no bootstrap park is needed here — vga_soft_reset parks
-             // the raster at v_cnt=V+1 (inside vblank, vga.v:714), so the first scan after release
-             // always starts at the frame TOP, and S_Blit_Raw arms vga_wait_vblank itself when the
-             // queue is empty. The one brief "black top+bottom" seen at the /47 480i pass start is
-             // therefore CRT vertical-lock settling after the codec-switch re-lock (physics), not
-             // an RTL defect. Watch item only.
+             // No bootstrap park is needed here. vga_soft_reset parks the raster at v_cnt=V+1,
+             // inside vblank (vga.v:714), so the first scan after release always starts at the top
+             // of the frame, and S_Blit_Raw arms vga_wait_vblank itself when the queue is empty.
+             // The brief black top and bottom seen at the start of a 480i pass is the CRT's
+             // vertical lock settling after the codec-switch re-lock, not an RTL defect.
            end
-           // RESUME path (active, the blit yielded to audio/fskip): fall through to S_Blit_Raw —
-           // its guards continue from px_vram/vram_bytes exactly like a resumed RAW blit. BUT if
-           // a frameskip repeat published PoC_frame_vram past our frame meanwhile, the blit guard
-           // is moot (the repeats already display this FB content) — DROP the present, or the
-           // Dispatcher->Present->Raw loop spins forever and starves the announce branch below it
-           // (measured: the engine never re-adopted after frame 1).
+           // Resume path (active, the blit yielded to audio/fskip): fall through to S_Blit_Raw,
+           // whose guards continue from px_vram/vram_bytes exactly like a resumed RAW blit. If a
+           // frameskip repeat published PoC_frame_vram past our frame meanwhile, the blit guard is
+           // moot because the repeats already display this FB content, so drop the present.
+           // Otherwise the Dispatcher->Present->Raw loop spins forever and starves the announce
+           // branch below it, and the engine never re-adopts after frame 1.
            else if (!(PoC_frame_ddr > PoC_frame_vram)) begin
              nlc_present_active <= 1'b0;
              state              <= S_Dispatcher;
@@ -1718,10 +1730,10 @@ always @(posedge clk_sys) begin
                nlc_compressed_bytes  <= lz4_size;
                nlc_reset             <= 1'b1;
                nlc_busy              <= 1'b1;   // STAGE A: decode now in-flight; run to completion before adopting a new frame
-               auto_blit_lz4         <= 1'b1;   // ARM the dispatcher keep-alive AT DECODE START (the /42 park bug:
-                                                // Header only arms it when nlc_busy was ALREADY 1, so a frame
-                                                // interrupted before any re-entry parked in the Dispatcher until
-                                                // the NEXT announce - 40ms at the /42 sender cadence)
+               auto_blit_lz4         <= 1'b1;   // arm the dispatcher keep-alive at decode start. Header only arms
+                                                // it when nlc_busy was already 1, so a frame interrupted before any
+                                                // re-entry parked in the Dispatcher until the next announce, about
+                                                // 40ms at the sender cadence that exposed it
                nlc_stall_cnt         <= 21'd0;  // arm the liveness window fresh per frame
                nlc_lb_wcnt           <= 8'd0;   // STAGE 1: fresh chunk accumulator + flush pointer per frame
                nlc_flushed_bytes     <= 28'd0;
@@ -1772,22 +1784,23 @@ always @(posedge clk_sys) begin
            if (vram_queue > (PoC_H << 2)) vga_wait_vblank <= 1'b0;   // VRAM primed -> let the beam scan. DEEPER than
                                                               // LZ4's 1-line prime (:1408): NLC decode (2.09 cyc/px)
                                                               // is slower, so 1 line of buffer briefly underruns at
-                                                              // frame boundaries (the /43+/44 end-of-frame sync=0
-                                                              // flashes). ~4 lines carries enough to cover the
+                                                              // frame boundaries, which shows as the end-of-frame
+                                                              // sync drop. ~4 lines carries enough to cover the
                                                               // refill gap. Primes in ~0.1ms << vblank -> never hangs.
                                                               // (TUNABLE: deepen to <<3 if HW sync=0 still >0.)
            if (!PoC_frame_lz4_FB) vga_soft_reset <= 1'b0;      // release the raster soft-reset (mirror LZ4 :1409)
            // COMMIT decision (blocking temp so the exit routing below sees THIS cycle's commit). Same guards as
-           // before (long_valid once via ub>wr_bytes; px<vga_pixels; NOT vram_req_ready — the /39 bootstrap-
-           // deadlock lesson) + chunk-space (wcnt<NLC_CHUNK: no commit while the chunk awaits its flush).
-           // NOTE: no !(ddr_data_write&&ddr_busy) term — Inflate no longer issues DDR writes (the flush does), so
-           // the decoder NO LONGER FREEZES per FB write; it only pauses during the per-chunk flush.
-           // /46 MODE 1 (B-throttle) is RETIRED (/47): measured intrinsically conflicted — the throttled
-           // stream and the frameskip share ONE vram_queue counter, so no threshold both arms the
-           // frameskip (<1 line) and keeps the decode progressing (>=4 lines) => wedge (full data in the
-           // /46 commit + memory). Its `vram_queue < (PoC_H<<2)` term also put the fifo_vga queue counter
-           // straight into the vram_in commit gating = the /47 worst setup path (-0.410ns). Mode 2
-           // (B-autonomous engine) supersedes it; nlc_disp_mode==1 now behaves as mode 0.
+           // before: long_valid once via ub>wr_bytes, px<vga_pixels, and deliberately not vram_req_ready,
+           // which is what caused the bootstrap deadlock. Plus chunk space (wcnt<NLC_CHUNK: no commit while
+           // the chunk awaits its flush). There is no !(ddr_data_write&&ddr_busy) term because Inflate no
+           // longer issues DDR writes, the flush does, so the decoder no longer freezes per FB write and
+           // only pauses during the per-chunk flush.
+           // Mode 1, the throttled path, is retired. It was intrinsically conflicted: the throttled stream
+           // and the frameskip share one vram_queue counter, so no threshold both arms the frameskip
+           // (under 1 line) and keeps the decode progressing (4 lines or more), which wedges. Its
+           // `vram_queue < (PoC_H<<2)` term also put the fifo_vga queue counter straight into the vram_in
+           // commit gating, which became the worst setup path at -0.410ns. Mode 2, the autonomous engine,
+           // supersedes it, and nlc_disp_mode==1 now behaves as mode 0.
            nlc_m1_go = 1'b1;
            nlc_commit_v = nlc_long_valid && nlc_uncompressed_bytes > PoC_subframe_wr_bytes
                           && PoC_subframe_px_lz4 < vga_pixels && nlc_lb_wcnt < NLC_CHUNK && nlc_m1_go;
@@ -1799,7 +1812,7 @@ always @(posedge clk_sys) begin
              nlc_lb_wcnt           <= nlc_lb_wcnt + 1'b1;
              PoC_subframe_wr_bytes <= PoC_subframe_wr_bytes + 8'd8;
              nlc_stall_cnt         <= 21'd0;   // progress -> reset the liveness window
-             // STREAM the decoded word straight into VRAM (mirror LZ4 :1432) — THIS is the display; keeps the
+             // Stream the decoded word straight into VRAM (mirror LZ4 :1432). This is the display, and keeps the
              // sub-frame FIFO fed ahead of the beam.
              if (!vram_drive_raw && !PoC_frame_lz4_FB && vram_synced && PoC_subframe_px_lz4 < vga_pixels) begin
                vram_drive_lz4          <= 1'b1;
@@ -1868,13 +1881,14 @@ always @(posedge clk_sys) begin
            PoC_lz4_resume_blit   <= cmd_fskip;
            PoC_lz4_resume_audio  <= cmd_audio;
            if (nlc_writed_bytes + 8'd7 >= PoC_subframe_lz4_ddr_bytes) PoC_subframe_blit_lz4 <= PoC_subframe_blit_lz4_ddr;
-           // STAGE A2: complete on the SAME deterministic measure as Inflate (nlc_frame_done) — NOT bare
-           // `blit==65535` (for the slow NLC decode that sentinel arrives at ~3% of the frame, so completing
-           // on it alone would publish a near-empty FB). nlc_frame_done = FB-full OR nlc_done OR liveness-stall.
+           // Complete on the same deterministic measure as Inflate (nlc_frame_done), not on a bare
+           // `blit==65535`. For the slow NLC decode that sentinel arrives at about 3% of the frame, so
+           // completing on it alone would publish a near-empty FB. nlc_frame_done means FB full, or
+           // nlc_done, or a liveness stall.
            if (nlc_frame_done) begin
              if (vram_drive_lz4 && !cmd_fskip) begin
-               // STREAMING completed: the frame was decoded straight into VRAM during Inflate — just PUBLISH it
-               // (mirror LZ4 End :1451). This is the normal 240p path: no FB->VRAM blit, no DDR contention.
+               // Streaming completed: the frame was decoded straight into VRAM during Inflate, so just publish
+               // it (mirror LZ4 End :1451). This is the normal 240p path: no FB->VRAM blit, no DDR contention.
                if (PoC_frame_lz4_ddr > PoC_frame_vram) begin
                  PoC_frame_ddr         <= PoC_frame_lz4_ddr;
                  PoC_frame_vram        <= PoC_frame_lz4_ddr;
@@ -1885,13 +1899,13 @@ always @(posedge clk_sys) begin
                vga_wait_vblank         <= 1'b0;
                vram_reset              <= (!vram_synced || PoC_subframe_px_lz4 != vga_pixels) ? 1'b1 : 1'b0;
              end else begin
-               // FB-mode fallback (late frame / VRAM not ready): present the FB via RAW's proven S_Blit_Raw,
-               // BOUNDARY-ALIGNED (the /42-visuals fix): park the raster (vga.v holds its internal wait until
-               // the next vblank) + clear the FIFO residue left by in-flight fskip repeats. Without this the
-               // blit lands MID-SCAN appended after repeat pixels = the /42 wrapped/segmented bands.
-               // NUMBER SPACE: once repeats run, PoC_frame_vram lives in the DISPLAY-frame space (Auto_First
-               // publishes vga_frame+1). Present with the same numbering or S_Blit_Raw's guard silently skips
-               // the blit (a black parked frame instead of the fresh one).
+               // FB-mode fallback (late frame, or VRAM not ready): present the FB via RAW's S_Blit_Raw,
+               // aligned to a frame boundary. Park the raster, so vga.v holds its internal wait until the next
+               // vblank, and clear the FIFO residue left by in-flight fskip repeats. Without this the blit
+               // lands mid-scan, appended after repeat pixels, which produces the wrapped and segmented band
+               // artefact. Note the number space: once repeats run, PoC_frame_vram lives in display-frame
+               // numbering, because Auto_First publishes vga_frame+1. Present with the same numbering or
+               // S_Blit_Raw's guard silently skips the blit and leaves a black parked frame.
                PoC_frame_ddr           <= vga_frame + 1'b1;
                PoC_subframe_px_ddr     <= vga_pixels;
                PoC_subframe_px_vram    <= 24'd0;
@@ -1994,11 +2008,11 @@ always @(posedge clk_sys) begin
          end
    endcase
 
-   // /55 DISPLAY LIVENESS NET (last safety layer): the freeze detector saw >=2 full
-   // frames of sync=0 with a frozen VRAM write counter while inited. Force the vram
-   // resync ourselves so no stuck/starved dispatch path can leave the display red
-   // forever (worst case: one repeated recovery attempt per 2-frame window). Placed
-   // AFTER the endcase so it overrides any same-cycle state assignment to vram_reset.
+   // Display liveness net, the last safety layer: the freeze detector saw two or more
+   // full frames of sync=0 with a frozen VRAM write counter while inited. Force the vram
+   // resync here so no stuck or starved dispatch path can leave the display red forever;
+   // the worst case is one repeated recovery attempt per 2-frame window. Placed after the
+   // endcase so it overrides any same-cycle state assignment to vram_reset.
    if (dbg_freeze_hit) vram_reset <= 1'b1;
 
 end
@@ -2014,6 +2028,7 @@ assign CLK_VIDEO = clk_sys;
 wire vram_req_ready;
 wire vram_end_frame;
 wire vram_synced;
+wire vram_starve;
 wire[23:0] vga_pixels, vram_pixels;
 wire[23:0] vram_queue;
 
@@ -2085,10 +2100,12 @@ vga vga
  .cmd_blit_vsync (cmd_blit_vsync),    // blit command to know vga_vcount
  .vsync_skip     (vga_frameskip || !vram_synced),
  .vsync_overlay  (hps_vsync_overlay), // vsync overlay
+ .vram_defer_sync(!vram_drive_lz4),   // defer on the framebuffer-fed path; LZ4 streaming keeps the immediate stop
  //.error_overlay  (error_overlay),
  .vram_ready     (vram_req_ready),    // vram it's ready to write a new pixel    
  .vram_end_frame (vram_end_frame),    // in vram there ara all pixels of current frame      
  .vram_synced    (vram_synced),       // vram it's synced on frame
+ .vram_starve    (vram_starve),       // starve strobe -> starved-pixel telemetry
  .vram_pixels    (vram_pixels),       // pixels on vram (reset after saved new pixel of the next frame)      
  .vram_queue     (vram_queue),        // pixels prepared to read
  .vga_frame      (vga_frame),         // vga vblanks counter
@@ -2283,10 +2300,10 @@ lz4 lz4
  .lz4_delta_long         (PoC_lz4_delta_FB[PoC_lz4_delta_index])
 );
 
-// ---- NLC (block-adaptive near-lossless) decoder — clean FB-only path (codec_mode==2) ----
+// ---- NLC (block-adaptive near-lossless) decoder: clean FB-only path (codec_mode==2) ----
 // Reuses the LZ4 blit transport (DDR-LZ zones + lz4_size announce); codec_mode selects this vs lz4.v.
 // NLC always decodes to the framebuffer (decode is slower than the beam); the clean auto-blit displays it.
-// NO dbuf, NO watchdog, NO live-streaming — see plan ARCHITECTURE REASSESSMENT.
+// No double buffer, no watchdog and no live streaming: the auto-blit is the only display path.
 reg         nlc_reset            = 1'b1;
 reg         nlc_write_long       = 1'b0;
 reg  [63:0] nlc_compressed_long  = 64'd0;
@@ -2298,8 +2315,9 @@ reg  [20:0] nlc_stall_cnt        = 21'd0;  // liveness: Inflate cycles without a
                                            // VBLANK (~1.4ms = ~120k cyc): the streaming decoder legitimately waits out
                                            // the whole blank with a full VRAM FIFO (no drain) at 480p. 2^20 = 12.7ms.
 // ---- STAGE 1 BURST FB WRITES: accumulate decoded words in an on-chip line buffer; flush each full chunk as ONE
-// DDR burst transaction. /41-calibrated: each single-beat write costs ~80 cyc of per-TRANSACTION f2sdram overhead
-// (28,800/frame = the measured NLC 40ms); bursting amortizes it (oracle: 41ms -> ~7-10ms @240p = ~60fps). ----
+// DDR burst transaction. Calibrated against hardware: each single-beat write costs ~80 cycles of per-transaction
+// f2sdram overhead, and at 28,800 writes per frame that is the measured NLC frame time of 40ms. Bursting
+// amortizes it, taking 41ms down to roughly 7-10ms at 240p, which is 60fps. ----
 localparam  NLC_CHUNK            = 8'd120;  // words per burst (960 B); linear chunking, resolution-agnostic
 (* ramstyle = "M10K" *) reg [63:0] nlc_lbuf [0:127];   // 128x64 = one M10K (SDP: FSM writes, registered read)
 reg  [63:0] nlc_lb_q;                      // registered read data (M10K recipe: NO reset, 1-ahead comb. address)
@@ -2311,7 +2329,7 @@ reg         nlc_flush_end        = 1'b0;   // route after the flush: 1 -> S_Blit
 reg         nlc_fl_pre           = 1'b0;   // flush prime 1 done (lb_q <- lbuf[0])
 reg         nlc_fl_run           = 1'b0;   // flush streaming (word 0 presented)
 reg         nlc_commit_v;                  // blocking temp: this cycle's Inflate commit fired
-reg         nlc_m1_go;                     // /46 blocking temp: mode-1 throttle gate (queue below the low threshold)
+reg         nlc_m1_go;                     // blocking temp: mode-1 throttle gate (queue below the low threshold)
 // flush read port: during streaming aim one ahead of the presented word (+2 across an accepted beat) so nlc_lb_q
 // always holds the NEXT word; outside streaming park at 0 / 1 for the two prime cycles.
 always @* begin
@@ -2324,16 +2342,16 @@ wire        nlc_write_ready, nlc_long_valid, nlc_paused, nlc_done;
 wire [63:0] nlc_uncompressed_long;
 wire [31:0] nlc_uncompressed_bytes, nlc_writed_bytes, nlc_readed_bytes;
 // STAGE A2 robust completion: the FB is fully written (deterministic) OR the decoder signalled done OR the
-// end-of-frame drain stalled past a bounded window (liveness — NLC must NEVER wedge the display, the same
+// end-of-frame drain stalled past a bounded window. NLC must never wedge the display, the same
 // guarantee LZ4 has via its 65535 escape). Decoder emits 3 bytes/pixel; a frame is vga_pixels*3 FB bytes.
 wire [27:0] nlc_frame_bytes = (vga_pixels << 1) + vga_pixels;
 wire        nlc_frame_done  = nlc_done
                             || (PoC_subframe_wr_bytes >= nlc_frame_bytes)
                             || (nlc_writed_bytes >= PoC_subframe_lz4_ddr_bytes && nlc_stall_cnt > 21'd1048575);
 
-// ---- /47 MODE 2: the autonomous decode engine + its FSM-side handshake registers ----
+// ---- Mode 2: the autonomous decode engine and its FSM-side handshake registers ----
 // The engine owns the decoder (via the input muxes below) and the DDR M1 port under
-// nlc_disp_mode==2; modes 0/1 are untouched (muxes select the FSM's registers).
+// nlc_disp_mode==2; modes 0 and 1 are untouched, with the muxes selecting the FSM's registers.
 reg         eng_pend_valid = 1'b0, eng_pend_final = 1'b0;
 reg  [23:0] eng_pend_frame = 24'd0;
 reg  [31:0] eng_pend_size  = 32'd0, eng_pend_bytes = 32'd0;
@@ -2394,18 +2412,19 @@ nlc_engine u_eng
  .eng_state      (eng_st_w)
 );
 
-// ---- /55 wedge telemetry: live debug words + first-freeze latch + liveness pulse ----
-// (/56: fully PIPELINED — see the declaration-site comment. Sources are registered
-// locally (stage 1: dbg_px_r/engfr_r/flush_r/sync_r/vb_r), then aggregated into the
-// hps_ext-facing word registers (stage 2). No combinational cross-module route
-// reaches hps_ext or the freeze latch.)
+// ---- wedge telemetry: live debug words, first-freeze latch, liveness pulse ----
+// Fully pipelined; see the declaration-site comment for why. Sources are registered
+// locally in stage 1 (dbg_px_r/engfr_r/flush_r/sync_r/vb_r), then aggregated into the
+// hps_ext-facing word registers in stage 2. No combinational cross-module route
+// reaches hps_ext or the freeze latch.
 // Word 10 (live_a): [7:0] blit FSM state, [11:8] engine state, [13:12] ddr_mux2 grant,
 //                   [15:14] ddram state.
 // Word 11 (live_b): [0] ddram read_req, [1] eng busy, [2] eng pend_valid,
 //                   [3] freeze latched, [7:4] engine wd_fired count (sat),
 //                   [11:8] ddram read-watchdog count (sat),
-//                   [15:12] engine done_stb ROLLING count (/56: publish-rate visibility —
-//                           must tick ~1/poll at 60Hz; frozen = engine not completing).
+//                   [15:12] engine done_stb rolling count, which shows the publish rate:
+//                           it must tick about once per poll at 60Hz, and a frozen count
+//                           means the engine is not completing frames.
 // Word 12: frz latched ? freeze-time copy of word 10 : eng_cur_frame[15:0].
 // Word 13: frz latched ? freeze context {vga_frame[11:0], audio, pend, busy, read_req}
 //                      : {syncloss count, eng flushed_bytes[15:4]} (FB-write progress).
@@ -2415,13 +2434,15 @@ always @(posedge clk_sys) begin : dbg_pipe
   dbg_engfr_r <= eng_cur_frame[15:0];
   dbg_flush_r <= eng_flushed[19:4];
   dbg_sync_r  <= vram_synced;
+  dbg_starve_r<= vram_starve;
   dbg_vb_r    <= vblank_core;
   // stage 2: aggregate into the hps_ext-facing words
   dbg_live_a_r <= {dbg_ddram_state[1:0], dbg_mux_grant, eng_st_w, state};
   dbg_live_b_r <= {dbg_done_cnt, dbg_ddr_timeout_cnt, dbg_wd_cnt,
                    dbg_freeze_valid, eng_pend_valid, eng_busy_w, dbg_ddram_state[2]};
   dbg_w12_r    <= dbg_freeze_valid ? dbg_frz_a : dbg_engfr_r;
-  dbg_w13_r    <= dbg_freeze_valid ? dbg_frz_b : {dbg_syncloss_cnt, dbg_flush_r[11:0]};
+  dbg_w13_r    <= dbg_freeze_valid ? dbg_frz_b : {dbg_syncloss_cnt, dbg_flush_r[7:0]};
+  dbg_w14_r    <= dbg_starve_max;
 end
 
 always @(posedge clk_sys) begin : dbg_freeze_detect
@@ -2429,7 +2450,16 @@ always @(posedge clk_sys) begin : dbg_freeze_detect
   dbg_freeze_hit <= 1'b0;
   if (eng_done_stb) dbg_done_cnt <= dbg_done_cnt + 4'd1;   // rolling (wraps by design)
   if (eng_wd_fired && !old_wd && dbg_wd_cnt != 4'hF)      dbg_wd_cnt       <= dbg_wd_cnt + 4'd1;
-  if (!dbg_sync_r && !old_unsync && dbg_syncloss_cnt != 4'hF) dbg_syncloss_cnt <= dbg_syncloss_cnt + 4'd1;
+  if (!dbg_sync_r && !old_unsync && dbg_syncloss_cnt != 8'hFF) dbg_syncloss_cnt <= dbg_syncloss_cnt + 8'd1;
+  // Worst frame's starved-pixel total, rather than the longest contiguous run. The auto-blit
+  // refills each line, so a long stall arrives as several runs of at most PoC_H, and a contiguous
+  // measure would saturate at one line however big the stall was. The per-frame total scales with
+  // the stall and compares directly against PoC_H * AUTOBLIT_LEAD, the budget the lead buys.
+  if (ce_pix && dbg_starve_r) begin
+    if (dbg_starve_frm != 16'hFFFF) dbg_starve_frm <= dbg_starve_frm + 16'd1;
+    if (dbg_starve_frm >= dbg_starve_max) dbg_starve_max <= dbg_starve_frm + 16'd1;
+  end
+  if (dbg_vb_r && !old_vb) dbg_starve_frm <= 16'd0;   // per-frame accumulator
   if (dbg_vb_r && !old_vb) begin
     dbg_prev_px <= dbg_px_r;
     if (cmd_init && !dbg_sync_r && dbg_px_r == dbg_prev_px) begin
@@ -2448,7 +2478,9 @@ always @(posedge clk_sys) begin : dbg_freeze_detect
     dbg_freeze_valid  <= 1'b0;
     dbg_freeze_frames <= 2'd0;
     dbg_wd_cnt        <= 4'd0;
-    dbg_syncloss_cnt  <= 4'd0;
+    dbg_syncloss_cnt  <= 8'd0;
+    dbg_starve_frm    <= 16'd0;
+    dbg_starve_max    <= 16'd0;
     dbg_done_cnt      <= 4'd0;
   end
   old_vb     <= dbg_vb_r;

@@ -1,4 +1,4 @@
-// nlc_decode.v — block-adaptive (TILED) near-lossless decoder, line-interleaved.
+// nlc_decode.v: block-adaptive (TILED) near-lossless decoder, line-interleaved.
 //
 // Sim-verified bit-exact against the C golden model (api/nlc_codec.cpp) via
 // tools/run_sim.sh. Decodes the LSB-first bitstream: per scanline, per plane
@@ -7,7 +7,7 @@
 // per-plane line buffers; after the 3 planes of a line an inverse YCoCg-R (or
 // RGB pass-through) emits one RGB scanline.
 //
-// Deterministic: no per-symbol variable length, no back-references — cannot
+// Deterministic: no per-symbol variable length and no back-references, so it cannot
 // wedge (no watchdog). Stage-1 front-end; the MED/inverse-colour back-end is
 // what Stage-2 Rice will reuse.
 //
@@ -15,7 +15,7 @@
 //   * resolution / NEAR / colour are RUNTIME inputs (held stable per frame),
 //     sized for any width up to MAXW.
 //   * line buffers are per-plane DOUBLE buffers, ping-ponged by a parity bit
-//     (no per-line array copy) — clean single-write/single-read RAM.
+//     (no per-line array copy), giving a clean single-write, single-read RAM.
 //   * byte-stream I/O here; integration wraps a 64-bit DDR word feeder + an
 //     8-byte output packer around it.
 
@@ -96,7 +96,7 @@ module nlc_decode #(
     reg [15:0] tcnt;
     reg [4:0]  w;
 
-    // scratch (blocking) — decode is computed in-block against the live bitbuf
+    // scratch (blocking): decode is computed in-block against the live bitbuf
     // and line buffers to avoid continuous-assign / nonblocking delta skew.
     reg  [5:0]  cons;
     reg  [63:0] nb;
@@ -134,10 +134,10 @@ module nlc_decode #(
             bitbuf <= 64'd0; bitcnt <= 7'd0; lp <= 1'b0;
             st <= S_HDR; y <= 0; x <= 0; pl <= 0; tcnt <= 0; w <= 0; cx <= 0;
             done <= 1'b0;
-            // NB: do NOT reset bufY_q/bufCo_q/bufCg_q — these are the RAM read
+            // Do not reset bufY_q/bufCo_q/bufCg_q: these are the RAM read
             // output registers; resetting them forces the reg out of the M10K
-            // block (= uninferred "asynchronous read", the Fitter overflow). Same
-            // lesson as lz4.v's reverted window-clear-on-reset. Their reset value
+            // block, giving an uninferred asynchronous read and a Fitter overflow. This
+            // is why lz4.v's window-clear-on-reset was reverted too. Their reset value
             // is never observed: at y==0 the above-neighbour is masked, and every
             // real read follows a write.
         end else if (stall) begin
@@ -163,7 +163,7 @@ module nlc_decode #(
                     st   <= S_DAT1;
                 end
             end
-            // T residuals at width w — STAGE 1: MED predictor + residual decode.
+            // T residuals at width w. Stage 1: MED predictor and residual decode.
             // The long combinational half (RAM read -> plane mux -> comparators ->
             // predL) ends in a register; the dequant/clamp/write is in S_DAT2.
             S_DAT1: begin

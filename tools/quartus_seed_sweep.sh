@@ -11,13 +11,15 @@
 #
 # Usage:  tools/quartus_seed_sweep.sh [seed ...]      (default seed set below; cap 32 per plan)
 # Builds IN-PLACE: output_files/, db/, incremental_db/ are .gitignored, so git stays clean.
+# Logs go to .notes/, not build_output/ - that directory is the shipped kit (rbf + HPS binary) and
+# nothing else. Override with LOG=<path>.
 set -u
-export PATH=/home/milov/intelFPGA_lite/17.0/quartus/bin:$PATH
+export PATH="${QUARTUS_BIN:-$HOME/intelFPGA_lite/17.0/quartus/bin}:$PATH"
 cd "$(dirname "$0")/.."                      # repo root (Groovy.qpf lives here)
 REV=Groovy
 SEEDS=("$@"); [ ${#SEEDS[@]} -eq 0 ] && SEEDS=(3 1 2 4 5 6 7 8)   # try the current pin (3) first
 [ ${#SEEDS[@]} -gt 32 ] && { echo "cap is 32 seeds"; exit 2; }
-LOG=build_output/seed_sweep_idle.log
+LOG="${LOG:-.notes/seed_sweep.log}"   # build_output/ holds deployables only; build logs live in .notes/
 : > "$LOG"
 say(){ echo "$*" | tee -a "$LOG"; }
 
@@ -44,8 +46,11 @@ for s in "${SEEDS[@]}"; do
       best_slack="$worst"; best_seed="$s"
       cp -f output_files/${REV}.sof "output_files/${REV}_seed${s}.sof" 2>/dev/null || true
     fi
-    # early-out: comfortable margin -> stop sweeping
-    awk "BEGIN{exit !(${worst:-0} >= 0.10)}" && { say "seed $s clears +0.10 ns — stopping early"; break; }
+    # early-out: comfortable margin -> stop sweeping. SWEEP_ALL=1 evaluates every seed instead
+    # and keeps the largest slack, which is what you want when the design has just changed.
+    if [ "${SWEEP_ALL:-0}" != "1" ]; then
+      awk "BEGIN{exit !(${worst:-0} >= 0.10)}" && { say "seed $s clears +0.10 ns — stopping early"; break; }
+    fi
   fi
 done
 

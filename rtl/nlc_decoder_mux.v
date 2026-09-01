@@ -1,7 +1,7 @@
-// nlc_decoder_mux.v — drop-in replacement for the `lz4` instance in Groovy.sv.
+// nlc_decoder_mux.v: drop-in replacement for the `lz4` instance in Groovy.sv.
 //
 // Presents the EXACT lz4 port interface so the blit FSM (and all its frame/vram
-// bookkeeping) is reused UNCHANGED — only the instantiation line in Groovy.sv
+// bookkeeping) is reused unchanged; only the instantiation line in Groovy.sv
 // swaps `lz4 lz4(...)` for `nlc_decoder_mux lz4(...)` plus the extra codec_mode /
 // nlc_* / cfg_* ports. Internally it instantiates both the real LZ4 decoder and
 // the NLC decoder (nlc_decode_ddr) and muxes by codec_mode:
@@ -11,7 +11,7 @@
 //   codec_mode == 2  → the NLC block decodes; LZ4 is idle and its watchdog masked.
 //
 // The NLC decoder is sim-verified bit-exact (tools/run_sim.sh). The one thing that
-// can only be validated on hardware is the OUTPUT PACING — i.e. exactly when the
+// can only be validated on hardware is the output pacing, meaning exactly when the
 // FSM consumes a decoded word. First-cut: nlc out_ready = lz4_run && !lz4_stop
 // (mirrors how the FSM gates LZ4). >>> This is THE knob to tune on hardware if
 // frames tear/drop. <<<
@@ -110,7 +110,7 @@ module nlc_decoder_mux (
     assign lz4_error              = is_nlc ? 1'b0                  : li_error;
     assign lz4_watchdog           = is_nlc ? 1'b0                  : li_watchdog;   // NLC cannot wedge
     assign lz4_read_ready         = is_nlc ? 1'b1                  : li_read_ready;
-    // debug/observability — always from the LZ4 instance
+    // debug and observability, always from the LZ4 instance
     assign lz4_uncompressed_byte  = li_uncompressed_byte;
     assign lz4_byte_valid         = li_byte_valid;
     assign lz4_state              = li_state;

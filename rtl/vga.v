@@ -54,6 +54,10 @@ module vga (
    input       cmd_blit_vsync,
    input       vsync_skip,
    input       vsync_overlay,
+   input       vram_defer_sync,   // 1 = hold a starve until vblank (framebuffer-fed display).
+                                  // The LZ4 streaming path gates lz4_run on vram_synced and wants
+                                  // the immediate stop, so it drives this low and keeps the old
+                                  // behaviour exactly.
 	
 	//input       error_overlay,
    
@@ -62,6 +66,7 @@ module vga (
    output [23:0] vram_queue,
    output        vram_end_frame,   
    output        vram_synced,              
+   output        vram_starve,           // a visible pixel is being painted red right now
                         
    // VGA output        
    output [23:0] vga_frame,
@@ -141,6 +146,8 @@ reg[23:0] vram_pixel_counter = 24'd0;  // pixels of current frame on all vrams
 
 reg       vram_wait_vblank   = 1'b0;   // waiting vblank to read pixels from vram (soft reset)
 reg       vram_out_sync      = 1'b0;   // signal to detect when pixel isn't get from vram
+reg       vram_out_sync_pend = 1'b0;   // starve seen this frame, not yet told to the blit fsm
+reg       vram_starve_r      = 1'b0;   // registered starve strobe for the starved-pixel telemetry
 reg       vram_start         = 1'b0;   // start using vram
 reg       vga_started        = 1'b0;   // start vblanks counter
 
@@ -148,6 +155,7 @@ assign    vram_ready     = fifo_rgb_queue[0] + fifo_rgb_queue[1] + fifo_rgb_queu
 assign    vram_end_frame = vram_pixel_counter >= vga_pixels_frame;                    // vram with all frame
 assign    vram_pixels    = vram_pixel_counter;                                        // number of current pixels writed on vram for a frame
 assign    vram_synced    = !vram_out_sync;                                            // from point of view vram, synced frame 
+assign    vram_starve    = vram_starve_r;
 assign    vram_queue     = fifo_rgb_queue[0] + fifo_rgb_queue[1] + fifo_rgb_queue[2] + fifo_rgb_queue[3] + fifo_rgb_queue[4] + fifo_rgb_queue[5]; // pixels prepared to read
 assign    vga_pixels     = vga_pixels_frame;                                          // pixels to get all frame
 
@@ -744,6 +752,24 @@ end
 // show pixel
 always@(posedge clk_sys) begin                                                          
    
+   // A starve used to reach the blit fsm immediately: it reset vram, which parked the output on
+   // vram_wait_vblank, and every remaining visible pixel of the frame came out black. One dry
+   // pixel therefore cost half a screen. Hold the flag until vertical blanking instead. The rest
+   // of the frame still draws, displaced by however many pixels were missed - the read pointer
+   // does not advance while red is on the output - and the resync lands in the blank, where it
+   // is free. A one frame shift of about a line, rather than a black band.
+   // Ahead of the reset clause so a reset in the same cycle still wins.
+   if (vram_out_sync_pend && vb) vram_out_sync <= 1'b1;
+
+   // The pending flag is otherwise cleared only by vram_reset, so a starve latched just before a
+   // session ends survives the teardown and gets propagated into the next session's first vertical
+   // blank - reporting a sync loss that belongs to the previous session, against a starved-pixel
+   // count that was zeroed with it. Drop it whenever the display is not being fed from vram.
+   if (!vram_active) begin
+     vram_out_sync      <= 1'b0;
+     vram_out_sync_pend <= 1'b0;
+   end
+
    if (vga_reset) begin
      vga_started <= 1'b0;    
    end   
@@ -751,6 +777,7 @@ always@(posedge clk_sys) begin
    if (vga_reset || vram_reset) begin         
      vram_wait_vblank  <= 1'b1;       
      vram_out_sync     <= 1'b0;           
+     vram_out_sync_pend<= 1'b0;
      vram_start        <= 1'b0;             
      fifo_ahead        <= 1'b0;
      fifo_rd           <= 3'd0;
@@ -799,8 +826,11 @@ always@(posedge clk_sys) begin
          pixel_counter                <= pixel_counter + 1'd1;  
          if (!fifo_ahead) begin      
            pixel                      <= {R_NO_VRAM, G_NO_VRAM, B_NO_VRAM};
-           vram_out_sync              <= 1'b1;
+           vram_out_sync_pend         <= 1'b1;
+           if (!vram_defer_sync) vram_out_sync <= 1'b1;   // legacy immediate resync
+           vram_starve_r              <= 1'b1;
          end else begin
+           vram_starve_r              <= 1'b0;
            pixel                      <= {fifo_rgb_r[fifo_rd], fifo_rgb_g[fifo_rd], fifo_rgb_b[fifo_rd]}; 
            fifo_rgb_req[fifo_rd_next] <= fifo_rgb_empty[fifo_rd_next] ? 1'b0 : 1'b1;
            fifo_ahead                 <= fifo_rgb_empty[fifo_rd_next] ? 1'b0 : 1'b1;
@@ -809,6 +839,7 @@ always@(posedge clk_sys) begin
          end                                                                                                       
        end else begin
          pixel <= 24'h00;  //0v on blanking     
+         vram_starve_r <= 1'b0;
          if (vb) begin                                             
            pixel_counter    <= 24'd0;                                                      
            vram_wait_vblank <= 1'b0;                                       

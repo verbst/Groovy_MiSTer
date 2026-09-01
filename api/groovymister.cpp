@@ -20,7 +20,7 @@
 #endif
 
 // Hosts that already link LZ4 (PCSX2, RPCS3) define GM_SYSTEM_LZ4 to use the
-// system headers and skip building api/lz4/ — avoids duplicate-symbol link
+// system headers and skip building api/lz4/, which avoids duplicate-symbol link
 // errors. Only LZ4_compress_default/LZ4_compress_HC are used; API-stable.
 #ifdef GM_SYSTEM_LZ4
  #include <lz4.h>
@@ -102,7 +102,7 @@ typedef union
 // within a frame or two in healthy play, so a raster correction is a sub-frame
 // beam-race nudge. A spread beyond this many frames means the two counters
 // belong to different sessions (a reconnect where the core restarted its counter
-// but the host kept its own) — the derived sleep would be tens of seconds and
+// but the host kept its own). The derived sleep would then be tens of seconds and
 // WaitSync would busy-spin on it. Skip the correction instead. Matches the fbneo
 // host's field-validated GROOVY_RASTER_MAX_SPREAD.
 #define RASTER_MAX_FRAME_SPREAD 8
@@ -143,8 +143,8 @@ GroovyMister::GroovyMister()
 
 	m_RGBSize = 0;
 	m_nlcWidth = 0;
-	m_nlcDispMode = 2;   // /47 default: mode 2 (autonomous engine) — the rock-solid display path
-	m_nlcPack = 1;       // TILED default; setNlcPack(2) selects RICE (R0-gated: rice+near1 clears the /59 ingest ceiling)
+	m_nlcDispMode = 2;   // default: mode 2, the autonomous decode engine
+	m_nlcPack = 1;       // TILED default; setNlcPack(2) selects RICE, which with near level 1 fits under the HPS ingest ceiling
 	m_nearLevel = 0;     // lossless default; near 1 recommended for heavy 3D content
 	m_inputCaps = 0;     // legacy v1 inputs; setInputCaps(GM_CAP_INPUTS_V2 | ...) to opt in
 	m_preEncodedSize = 0;
@@ -351,7 +351,7 @@ void GroovyMister::CmdClose(void)
 }
 
 // Tear down the video-side resources (RIO queues/buffers + video socket)
-// exactly once per CmdInit — idempotent, so a failed CmdInit's internal
+// exactly once per CmdInit. Idempotent, so a failed CmdInit's internal
 // cleanup followed by the host's own CmdClose() is safe (previously that
 // double-ran closesocket + WSACleanup). The inputs socket is deliberately
 // NOT touched here: CmdInit never created it, and the auto-reconnect path
@@ -526,6 +526,26 @@ void GroovyMister::setInputCaps(uint8_t caps)
 
 int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Frames, uint32_t soundRate, uint8_t soundChan, uint8_t rgbMode, uint16_t mtu)
 {
+	// NLC only works with rgbMode 0. The FPGA decoder (rtl/nlc_decode_ddr.v) instantiates
+	// three plane cores, reads three segment lengths per line header, and packs 3 bytes per
+	// pixel. It has no pixel-format input, so the other two modes cannot round-trip:
+	//   rgbMode 1 (RGBA888): nlc_encode writes four plane segments per line. The FPGA reads
+	//     three and never consumes the alpha segment, so the next line header is read from
+	//     the middle of it and the stream loses framing on line 1.
+	//   rgbMode 2 (RGB565): nlc_encode returns -1, CmdBlit falls back to cSize=0 and sends a
+	//     raw-size blit header, but the core is still in compressed mode. It ends the frame on
+	//     the first payload packet and writes the remainder to the audio DDR zone.
+	// Both failed silently before this check. Reject early, before any socket or state is
+	// touched, so a rejected call leaves an existing session alone. Coercing rgbMode to 888
+	// here would not help: the caller would still fill the buffer with 565 or RGBA pixels
+	// that the core then reads as 888. setNearLevel() is the bandwidth control for NLC.
+	if (lz4Frames == GM_CODEC_NLC_TILED && rgbMode != 0)
+	{
+		LOG(0,"[MiSTer] CmdInit REJECTED: codec 7 (NLC) is RGB888-only, got rgbMode %d (%s). Use rgbMode 0, or an LZ4 codec (1-6) for this pixel format.\n",
+		      rgbMode, (rgbMode == 1) ? "RGBA888" : (rgbMode == 2) ? "RGB565" : "unknown");
+		return -1;
+	}
+
 	m_isConnected = 0;
 	// Clear stale per-session raster state before the version-probe/init ACKs, so
 	// a reconnect starts the raster servo and getACK's ACK gate from a clean slate
@@ -803,7 +823,7 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 
 	m_bufferSend[0] = CMD_INIT;
 	// codec byte: RAW=0, LZ4=1 (bare); NLC packs codec=2 + near + colour + pack
-	// ([1:0]=codec [3:2]=near [4]=colour [6:5]=dispMode [7]=RICE — R5 negotiation bit).
+	// ([1:0]=codec [3:2]=near [4]=colour [6:5]=dispMode [7]=RICE pack select).
 	// The HPS reads codec via &3; old cores see >1 and fall back to raw as intended.
 	m_bufferSend[1] = (lz4Frames == GM_CODEC_NLC_TILED)
 	                ? (char)(2 | ((m_nearLevel & 0x3) << 2) | (1 << 4) | ((m_nlcDispMode & 0x3) << 5) | ((m_nlcPack == 2 ? 1 : 0) << 7))
@@ -905,16 +925,17 @@ int GroovyMister::CmdSwitchres(double pClock, uint16_t hActive, uint16_t hBegin,
 	memcpy(&m_bufferSend[25],&interlace,sizeof(interlace));
 
 	// Unlike every other state-critical command (CmdInit, CmdBlit/ACK, CmdGetStatus), this
-	// send used to be pure fire-and-forget: no ACK, no retry, no return value. On the
-	// reconnect path (setAutoReconnect's watchdog) this lands immediately after CmdInit's own
-	// send with no natural gap between them, and was found to be lost 100% of the time on
-	// reconnect (never on the initial connect, where unrelated app startup work happens to
-	// separate the two sends by a few hundred ms). A lost switchres left the core's
-	// PoC_bytes_len at 0 forever — setInit()'s calloc zeroes it on every CmdInit, and only a
-	// successfully-processed CmdSwitchres restores it — silently discarding all incoming video
-	// data for the rest of the session with no way to recover short of a full reconnect.
-	// Retry like CmdInit already does (same getACK(60) pattern, same ACK the core already
-	// sends back for CMD_INIT/CMD_GET_STATUS).
+	// send was originally fire-and-forget: no ACK, no retry, no return value. On the
+	// reconnect path (setAutoReconnect's watchdog) it lands immediately after CmdInit's own
+	// send with no natural gap between them, and was lost on every reconnect attempt
+	// observed. It never failed on an initial connect, where unrelated application startup
+	// work happens to separate the two sends by a few hundred ms.
+	// A lost switchres leaves the core's PoC_bytes_len at 0 for good: setInit()'s calloc
+	// zeroes it on every CmdInit and only a successfully processed CmdSwitchres restores it,
+	// so the core silently discards all incoming video for the rest of the session with no
+	// way to recover short of a full reconnect. Retry the way CmdInit already does, using the
+	// same getACK(60) pattern and the same ACK the core sends back for CMD_INIT and
+	// CMD_GET_STATUS.
 	const int SWITCHRES_ATTEMPTS = 3;
 	uint32_t ackTime = 0;
 	for (int attempt = 0; attempt < SWITCHRES_ATTEMPTS && !ackTime; attempt++)
@@ -951,8 +972,8 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 	{
 		// after a FAILED auto-reconnect the session is down but the watchdog
 		// stays armed: fall through so the rate-limited retry below can run
-		// (otherwise "retry in 1s" could never fire — this early-out would
-		// block it forever)
+		// (otherwise "retry in 1s" could never fire, because this early-out
+		// would block it forever)
 		if (!(m_autoReconnect && m_noAckBlitCount >= 10 && m_initHost[0] != '\0'))
 		{
 			return;
@@ -963,7 +984,7 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 	// getACK() from WaitSync/DiffTimeRaster; if it stops advancing across
 	// blits the core has gone silent. Warn at 5 misses, reconnect at 10
 	// (~167ms at 60Hz), rate-limited to one attempt per second. The reconnect
-	// tears down ONLY the video side — the inputs socket and its local port
+	// tears down the video side only: the inputs socket and its local port
 	// survive, so the subscribe re-sent around the inner CmdInit restores the
 	// pad stream (the pre-init send lands in the core's one-shot CMD_INIT
 	// read; the post-init send is UDP-loss insurance for address-aware cores).
@@ -993,7 +1014,7 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 				}
 				m_lastReconnectAttemptMs = nowMs;
 
-				// CmdInit re-stashes into m_initHost — snapshot it first
+				// CmdInit re-stashes into m_initHost, so snapshot it first
 				char savedHost[sizeof(m_initHost)];
 				memcpy(savedHost, m_initHost, sizeof(savedHost));
 
@@ -1015,7 +1036,7 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 						{
 							// CmdSwitchres already retried internally and logged the ACK failure;
 							// PoC_bytes_len stays 0 on the core until a future reconnect gets it through
-							LOG(0,"[MiSTer] WARNING: modeline replay failed on reconnect — video will stay blank/corrupt until it succeeds\n");
+							LOG(0,"[MiSTer] WARNING: modeline replay failed on reconnect, video will stay blank/corrupt until it succeeds\n");
 						}
 					}
 					m_reconnectEpoch++;
@@ -1062,7 +1083,7 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 		{
 			// pre-encode fast path: the caller already wrote an EncodeNLC frame into getPBufferPreEncoded()
 			// (the per-blit software encode dominates the frame period on slow CPUs, e.g. ~40ms on the
-			// MiSTer's Cortex-A9 at 240p — pre-encoding each unique frame once restores full send cadence)
+			// MiSTer's Cortex-A9 at 240p, so pre-encoding each unique frame once restores full send cadence)
 			cSize = m_preEncodedSize;
 			m_preEncodedSize = 0;
 		}
@@ -1307,7 +1328,7 @@ uint32_t GroovyMister::getACK(DWORD dwMilliseconds)
 // Empty the send completion queue. Nothing ever dequeued m_sendQueue, so send
 // completions accumulated against the BUFFER_SLICES-deep CQ; once full,
 // RIOSend (and the CQ-sharing RIOReceive re-post) fail silently and datagrams
-// drop — seen in the field as an audio-load stall with false "no ACK"
+// drop. This shows up in the field as an audio-load stall with false "no ACK"
 // reconnects (audio doubles the send rate). Called every frame from WaitSync.
 uint32_t GroovyMister::drainSendCompletions(void)
 {
@@ -1368,7 +1389,7 @@ void GroovyMister::WaitSync(void)
 
 	// keep the send CQ empty + emit the telemetry summary every ~2s at
 	// verbose level 1 (watch sendFailed/recvRepostFailed climbing alongside
-	// ackTimeout — that is the send-CQ-full fingerprint)
+	// ackTimeout together is the send-CQ-full fingerprint)
 #ifdef _WIN32
 	if (USE_RIO)
 	{
@@ -1408,7 +1429,7 @@ int GroovyMister::DiffTimeRaster(void)
 
 		// Reconnect desync guard: bail before the multiply (also avoids the int
 		// overflow a huge spread would hit in m_widthTime * dif). Returning 0
-		// skips this frame's raster nudge — WaitSync then falls back to its
+		// skips this frame's raster nudge, and WaitSync falls back to its
 		// coarse frameTime pace, which is one un-aligned frame instead of a
 		// multi-second hang.
 		int64_t spread = (int64_t) fpga.frameEcho - (int64_t) fpga.frame;

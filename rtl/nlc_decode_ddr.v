@@ -1,4 +1,4 @@
-// nlc_decode_ddr.v — STAGE B PARALLEL near-lossless decoder (wire format v2).
+// nlc_decode_ddr.v: stage B parallel near-lossless decoder (wire format v2).
 //
 // Drop-in replacement for the serial wrapper: same ports, same LZ4-compatible counter
 // semantics, same Groovy.sv integration. Internally a complete rework for throughput:
@@ -6,10 +6,10 @@
 //   input FIFO (256x64, accepts 128-word feed bursts)
 //     -> LINE LOADER: word-router for the v2 line record
 //        [8B header: u16 lenY,lenCo,lenCg (padded byte lengths)] Y-seg Co-seg Cg-seg
-//        (all 64-bit-word-aligned) — routes each plane's segment into that plane's bank
+//        (all 64-bit-word-aligned), routing each plane's segment into that plane's bank
 //        (ping-pong: loads line N+1 while line N decodes)
 //     -> 3x nlc_plane_core DECODING IN x-LOCKSTEP (one shared controller):
-//        C_HDR (all planes consume their tile header together — tiles are x-aligned)
+//        C_HDR (all planes consume their tile header together, tiles being x-aligned)
 //        then per pixel C_A/C_B: the proven 2-cycle MED recurrence, three planes in
 //        parallel = ~2.06 cyc/PIXEL (vs ~7.19 serial) = ~40 Mpix/s @82.75MHz, above
 //        the 25.2 Mpix/s 480p60 beam.
@@ -22,7 +22,7 @@
 // Determinism preserved: TILED front-end, plus the R2 Golomb-Rice front-end (cfg_rice)
 // whose per-symbol length is HARD-BOUNDED by the 20-zero escape (max 35 bits/sample; the
 // plane cores' 128-bit accumulators guarantee single-cycle decode at the same 2-cycle
-// A/B cadence) — the decoder cannot wedge in either pack mode. Bit order per
+// A/B cadence), so the decoder cannot wedge in either pack mode. Bit order per
 // nlc_codec.h (LSB-first; 64-bit word = LE bytes).
 
 module nlc_decode_ddr #(
@@ -56,7 +56,7 @@ module nlc_decode_ddr #(
 
     // =========================== input FIFO (256 x 64) ================================
     (* ramstyle = "M10K" *) reg [63:0] ififo [0:255];
-    reg  [63:0] if_q;                       // registered read (no reset — M10K)
+    reg  [63:0] if_q;                       // registered read (no reset, infers M10K)
     reg  [8:0]  if_head, if_tail;
     wire [8:0]  if_count = if_head - if_tail;
     wire        if_empty = (if_count == 9'd0);
@@ -74,7 +74,7 @@ module nlc_decode_ddr #(
     end
 
     // =========================== line loader (word router) ============================
-    // Staged pop: present the tail address one cycle, take if_q the next (1 word/2cyc —
+    // Staged pop: present the tail address one cycle, take if_q the next, so one word per two cycles;
     // 4B/cyc routing, far above the worst-case feed need).
     reg         iw_valid;
     reg  [63:0] iw;
@@ -265,7 +265,7 @@ module nlc_decode_ddr #(
 
     // =========================== packer + output FIFO (128 x 64) ======================
     (* ramstyle = "M10K" *) reg [63:0] ofifo [0:127];
-    reg  [63:0] of_q;                        // registered read (no reset — M10K)
+    reg  [63:0] of_q;                        // registered read (no reset, infers M10K)
     reg         of_pop_st;                   // head refresh: 0=idle 1=tail address presented
     reg  [95:0] pk_acc;
     reg  [6:0]  pk_n;                        // valid bytes in pk_acc

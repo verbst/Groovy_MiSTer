@@ -1,4 +1,4 @@
-// clean_disp_tb.v — TRUSTWORTHY frame-dumping sim of the PRISTINE /mnt/c/git/_clean display stack:
+// clean_disp_tb.v: frame-dumping sim of the upstream display stack:
 // the REAL clean rtl/vga.v + rtl/fifo_vga.v + rtl/lz4.v + the clean blit FSM extracted VERBATIM from the
 // clean Groovy.sv (sim/extract_clean_fsm.sh -> /tmp/clean_fsm_gen/*.vh). NO NLC, NO dbuf. Feeds RAW and
 // real LZ4 frames the way the host does, and DUMPS the actual VGA_R/G/B output to one .ppm per frame so we
@@ -192,7 +192,37 @@ module clean_disp_tb;
     integer av_beatno = 0;                       // delivered read beats (hazard cadence)
     reg [28:0] av_rd_addr = 0, av_wr_addr = 0;
     reg av_reading = 0, av_hazard_r = 0, av_hz = 0;
-    assign AV_BUSY = (av_busy_left > 0) || av_hazard_r;
+    // ---- EXTERNAL-MASTER DDR STALL (models HPS traffic on the shared hard memory controller).
+    // Injected HERE, at the Avalon/f2sdram boundary, NOT at ddr_mux2: the contention modelled is
+    // another master on the SAME hard controller, which the fabric arbiter cannot see or mitigate.
+    //   +extstall_line=L  : beam line (vga vcount) at which the stall starts
+    //   +extstall_cyc=N   : clk_sys cycles to hold the controller busy
+    //   +extstall_first=F : first vga_frame to inject on (default 3, i.e. after bootstrap)
+    //   +extstall_every=E : inject at most once every E frames (default 1)
+    integer EXTSTALL_LINE = 0, EXTSTALL_CYC = 0, EXTSTALL_FIRST = 3, EXTSTALL_EVERY = 1;
+    integer av_ext_left = 0, ext_injections = 0, ext_last_frame = 0;
+    reg     ext_line_d = 0;
+    initial begin
+        if (!$value$plusargs("extstall_line=%d",  EXTSTALL_LINE))  EXTSTALL_LINE  = 0;
+        if (!$value$plusargs("extstall_cyc=%d",   EXTSTALL_CYC))   EXTSTALL_CYC   = 0;
+        if (!$value$plusargs("extstall_first=%d", EXTSTALL_FIRST)) EXTSTALL_FIRST = 3;
+        if (!$value$plusargs("extstall_every=%d", EXTSTALL_EVERY)) EXTSTALL_EVERY = 1;
+    end
+    always @(posedge clk_sys) begin
+        ext_line_d <= (vga_vcount == EXTSTALL_LINE[15:0]);
+        if (av_ext_left > 0) av_ext_left <= av_ext_left - 1;
+        if (EXTSTALL_CYC > 0 && (vga_vcount == EXTSTALL_LINE[15:0]) && !ext_line_d
+            && vga_frame >= EXTSTALL_FIRST
+            && (ext_injections == 0 || (vga_frame - ext_last_frame) >= EXTSTALL_EVERY)) begin
+            av_ext_left    <= EXTSTALL_CYC;
+            ext_last_frame  = vga_frame;
+            ext_injections  = ext_injections + 1;
+            $display("[EXTSTALL] vga_frame=%0d line=%0d hold=%0d cyc | vram_queue=%0d vram_pixels=%0d cyc=%0d",
+                     vga_frame, vga_vcount, EXTSTALL_CYC, vram_queue, vram_pixels, cycles);
+        end
+    end
+
+    assign AV_BUSY = (av_busy_left > 0) || av_hazard_r || (av_ext_left > 0);
     always @(posedge clk_sys) begin
         AV_DOUT_READY <= 1'b0;
         av_hazard_r   <= 1'b0;
@@ -433,6 +463,7 @@ module clean_disp_tb;
 
     // ----------------------------------------------------------------- REAL clean vga.v
     wire        vram_req_ready, vram_synced, vram_end_frame;
+    wire        vram_starve;
     wire [23:0] vram_pixels, vram_queue, vga_frame, vga_pixels;
     wire [15:0] vga_vcount;
     wire [7:0]  vr, vg, vb; wire vga_de_w, vga_hblank, VGA_F1, vga_hs, vga_vs;
@@ -452,9 +483,9 @@ module clean_disp_tb;
         .vram_wren4(vram_wren4), .r_vram_in4(r_vram_in4), .g_vram_in4(g_vram_in4), .b_vram_in4(b_vram_in4),
         .r_in(r_in), .g_in(g_in), .b_in(b_in),
         .cmd_blit_vsync(cmd_blit_vsync),
-        .vsync_skip(vga_frameskip || !vram_synced), .vsync_overlay(1'b0),
+        .vsync_skip(vga_frameskip || !vram_synced), .vsync_overlay(1'b0), .vram_defer_sync(!vram_drive_lz4),
         .vram_ready(vram_req_ready), .vram_pixels(vram_pixels), .vram_queue(vram_queue),
-        .vram_end_frame(vram_end_frame), .vram_synced(vram_synced),
+        .vram_end_frame(vram_end_frame), .vram_synced(vram_synced), .vram_starve(vram_starve),
         .vga_frame(vga_frame), .vcount(vga_vcount), .vga_pixels(vga_pixels),
         .hsync(vga_hs), .vsync(vga_vs), .r(vr), .g(vg), .b(vb),
         .vga_de(vga_de_w), .hblank(vga_hblank), .vblank(vblank_core), .vga_f1(VGA_F1));
@@ -540,6 +571,7 @@ module clean_disp_tb;
                 if (maxrow > 1) begin
                     $sformat(fname, "frame_%0d_%03d_fv%0d.ppm", CODEC, frames_out, PoC_frame_vram);
                     dump_ppm(fname, maxrow + 1);
+                    analyse_frame(maxrow + 1);
                     // latency analysis hook: pair with the [ANN] lines (announce cycle per frame#)
                     // to compute announce -> displayed-content latency offline (P2.4)
                     $display("[CAP] file=%0s cyc=%0d", fname, cycles);
@@ -549,6 +581,65 @@ module clean_disp_tb;
             end
         end
     end
+    // Two measures of the same thing, so the real telemetry can be checked against ground truth.
+    // GROUND TRUTH samples vram_starve directly on ce_pix. The MIRROR reproduces Groovy.sv exactly,
+    // including the one-cycle dbg_pipe register the strobe passes through before an edge-sensitive
+    // ce_pix samples it - hardware reported a sync-loss with starve_px=0, which should be impossible,
+    // and this pair is what tells the two apart.
+    integer starve_run = 0, starve_max = 0, starve_px_total = 0;      // ground truth
+    reg tb_vb_d = 0;
+    always @(posedge clk_sys) begin
+        tb_vb_d <= vblank_core;
+        if (ce_pix && display_up && vram_starve) begin
+            starve_run = starve_run + 1;
+            starve_px_total = starve_px_total + 1;
+            if (starve_run > starve_max) starve_max = starve_run;
+        end
+        if (vblank_core && !tb_vb_d) starve_run = 0;
+    end
+
+    // exact mirror of Groovy.sv dbg_pipe + dbg_freeze_detect
+    reg        m_starve_r = 0, m_sync_r = 1, m_vb_r = 0, m_old_vb = 0, m_old_unsync = 0;
+    integer    m_starve_frm = 0, m_starve_max = 0, m_syncloss = 0;
+    always @(posedge clk_sys) begin
+        m_starve_r <= vram_starve;
+        m_sync_r   <= vram_synced;
+        m_vb_r     <= vblank_core;
+        if (!m_sync_r && !m_old_unsync && m_syncloss != 255) m_syncloss = m_syncloss + 1;
+        if (ce_pix && m_starve_r) begin
+            if (m_starve_frm != 65535) m_starve_frm = m_starve_frm + 1;
+            if (m_starve_frm >= m_starve_max) m_starve_max = m_starve_frm + 1;
+        end
+        if (m_vb_r && !m_old_vb) m_starve_frm = 0;
+        m_old_vb     <= m_vb_r;
+        m_old_unsync <= !m_sync_r;
+    end
+
+    // ARTIFACT ANALYSER: red = vga.v R_NO_VRAM (FIFO starved); black-after-red = the vram_reset park
+    // (vram_wait_vblank blanks the rest of the frame). Content baseline is measured by the no-inject run.
+    integer red_n, blk_n, first_red_row, first_red_col, blk_after, last_red_row;
+    task analyse_frame(input integer rows);
+        integer x, y, i, rr, seen_red;
+        begin
+            rr = (rows > H) ? H : rows;
+            red_n = 0; blk_n = 0; first_red_row = -1; first_red_col = -1;
+            blk_after = 0; seen_red = 0; last_red_row = -1;
+            for (y = 0; y < rr; y = y + 1)
+              for (x = 0; x < W; x = x + 1) begin
+                i = (y*W + x)*3;
+                if (img[i] == 8'hFF && img[i+1] == 8'h00 && img[i+2] == 8'h00) begin
+                    red_n = red_n + 1; last_red_row = y;
+                    if (!seen_red) begin seen_red = 1; first_red_row = y; first_red_col = x; end
+                end else if (img[i] == 8'h00 && img[i+1] == 8'h00 && img[i+2] == 8'h00) begin
+                    blk_n = blk_n + 1;
+                    if (seen_red) blk_after = blk_after + 1;
+                end
+              end
+            $display("[ANALYSE] fv=%0d rows=%0d red=%0d firstred=(r%0d,c%0d) lastredrow=%0d blackafterred=%0d blacktotal=%0d",
+                     PoC_frame_vram, rr, red_n, first_red_row, first_red_col, last_red_row, blk_after, blk_n);
+        end
+    endtask
+
     task dump_ppm(input [255:0] nm, input integer rows);
         integer i, fdo, rr;
         begin
@@ -863,6 +954,20 @@ module clean_disp_tb;
         if (display_up && !vblank_core && vram_synced && vram_queue < vqmin) vqmin = vram_queue;
     end
 
+    // TRUE starvation margin: vram_queue sampled only at an ACTIVE-AREA pixel pop (vqmin above also
+    // samples hblank, where nothing is being drained). vq_lt_line counts pops with under one line queued.
+    integer vqmin_act = 100000000, vq_lt_line = 0, act_px = 0;
+    integer vqmin_line = -1, vqlow_first = 100000, vqlow_last = 0;
+    always @(posedge clk_sys) if (ce_pix && display_up && vga_frame >= 3 && vga_de_w && vram_synced) begin
+        act_px = act_px + 1;
+        if (vram_queue < vqmin_act) begin vqmin_act = vram_queue; vqmin_line = vga_vcount; end
+        if (vram_queue < PoC_H) begin
+            vq_lt_line = vq_lt_line + 1;
+            if (vga_vcount < vqlow_first) vqlow_first = vga_vcount;
+            if (vga_vcount > vqlow_last)  vqlow_last  = vga_vcount;
+        end
+    end
+
     // FSM SCHEDULING — the /39 failure: the NLC FSM never COMMITS decoded frames on HW (frozen FB). Measure where
     // the FSM spends time (fskip auto-blit vs the NLC decode states) + how many FB writes actually fire + whether
     // the FB region ever CHANGES. If the sim reproduces /39 it will show: FSM starved into the auto-blit, ~0 FB
@@ -1060,6 +1165,11 @@ module clean_disp_tb;
         repeat (framep*2) @(posedge clk_sys);
         dump_fb("/tmp/fb_final.bin");   // FB (DDR) content after all frames — bisect decode/FB-write vs display
         $display("RESULT: frames_out=%0d vga_frame=%0d PoC_frame_vram=%0d nlc_displayed=%0d (of %0d fed) cepix=%0d WBcost=%0d | FIFO: underrun=%0d vqmin=%0d | WEDGED=%0d BUSWEDGE=%0d FREEZE=%0d ENGWEDGE=%0d engdone=%0d", frames_out, vga_frame, PoC_frame_vram, nlc_displayed, N_FRAMES, CEPIX, WR_OVERHEAD+WR_BEAT, vram_unsync_events, vqmin, wedged, buswedge_logged, dbg_freeze_valid, engwedge_logged, eng_done_total);
+        $display("MARGIN: vqmin_active=%0d (queue at an active pixel pop) | pops_under_one_line=%0d of %0d (%0d%%) | PoC_H=%0d | extstalls=%0d",
+                 vqmin_act, vq_lt_line, act_px, act_px ? 100*vq_lt_line/act_px : 0, PoC_H, ext_injections);
+        $display("MARGIN2: vqmin hit at line %0d | low-queue pops span lines %0d..%0d", vqmin_line, vqlow_first, vqlow_last);
+        $display("STARVE: worst frame=%0d px (%0d.%0d lines) | total starved px=%0d | lead budget=%0d px", starve_max, starve_max/W, (starve_max*10/W)%10, starve_px_total, W*16);
+        $display("STARVE-MIRROR (as Groovy.sv computes it): syncloss=%0d starve_max=%0d   | GROUND TRUTH: total=%0d max=%0d", m_syncloss, m_starve_max, starve_px_total, starve_max);
         $display("THRUPUT: codec=%0d published=%0d pub_period=%0d.%0dms | NLC_decode_time(nlc_busy) n=%0d avg=%0d.%0d ms (HW NLC ~40ms)", CODEC, eof_frames, pub_period_n?(pub_period_sum/pub_period_n)/82754:0, pub_period_n?((pub_period_sum/pub_period_n)*10/82754)%10:0, nb_n, nb_n?(nb_sum/nb_n)/82754:0, nb_n?((nb_sum/nb_n)*10/82754)%10:0);
         $display("REPEATS: fskip_pulses=%0d auto_first=%0d auto_line=%0d blit_raw=%0d", fsk_pulses, auto_first_n, auto_line_n, blitraw_n);
         if (CLOSEDLOOP && feed_per_n > 0)
