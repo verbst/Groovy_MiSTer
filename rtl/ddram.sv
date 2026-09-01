@@ -18,17 +18,18 @@
 //
 // ------------------------------------------
 //
-// /55 WEDGE HARDENING (read-beat liveness):
-//  * Avalon readdatavalid (DDRAM_DOUT_READY) is INDEPENDENT of waitrequest
+// Wedge hardening (read-beat liveness):
+//  * Avalon readdatavalid (DDRAM_DOUT_READY) is independent of waitrequest
 //    (DDRAM_BUSY). The historical template only sampled DOUT_READY inside the
 //    !DDRAM_BUSY block, so a beat arriving during busy was silently dropped and
-//    the edge-latched read_req never cleared -> mem_busy stuck high forever ->
-//    both ddr_mux2 masters (blit FSM + NLC engine) frozen = the /55 permanent
-//    red-screen wedge signature. Read beats are now consumed UNCONDITIONALLY.
-//  * state-000 arbitration used to require (mem_wr && !read_req) vs
-//    (read_req && !mem_wr): both pending = neither served = deadlock by
-//    construction. Reads (edge-latched, master already committed and counting
-//    beats) now win; writes are level-held upstream and simply wait.
+//    the edge-latched read_req never cleared. mem_busy then stuck high forever
+//    and froze both ddr_mux2 masters, the blit FSM and the NLC engine: the
+//    permanent bus wedge, which shows on screen as a red frame. Read beats are
+//    now consumed unconditionally.
+//  * state-000 arbitration used to require (mem_wr && !read_req) against
+//    (read_req && !mem_wr), so both pending meant neither was served, a deadlock
+//    by construction. Reads now win, being edge-latched with the master already
+//    committed and counting beats; writes are level-held upstream and simply wait.
 //  * read watchdog: if an issued read stops receiving beats for 2^16 cycles
 //    (~0.8ms @82MHz, >>100x any legit latency), the remaining beats are
 //    synthesized (data 0xDEAD...) so the masters' beat counters always
@@ -57,7 +58,7 @@ module ddram
         output        mem_busy,
         output        mem_dready,
 
-        // /55 telemetry
+        // telemetry
         output [2:0]  dbg_state,        // {read_req, state[1:0]}
         output [3:0]  dbg_timeout_cnt   // saturating count of read-watchdog fires
 );
@@ -77,7 +78,7 @@ reg read_req = 0;
 
 reg [2:0] state = 3'b000;
 
-// /55 read watchdog
+// read watchdog
 reg [16:0] rd_wd = 0;
 reg  [3:0] timeout_cnt = 0;
 wire       rd_wd_fired = rd_wd[16];
@@ -92,9 +93,9 @@ always @(posedge DDRAM_CLK) begin
 
         data_ready <= 1'b0;
 
-        // /55: read beats consumed regardless of DDRAM_BUSY (Avalon: readdatavalid
-        // is independent of waitrequest). Missing beats are synthesized when the
-        // watchdog fires so a read transaction ALWAYS terminates.
+        // Read beats are consumed regardless of DDRAM_BUSY, since Avalon readdatavalid
+        // is independent of waitrequest. Missing beats are synthesized when the
+        // watchdog fires, so a read transaction always terminates.
         if (state == 3'b010) begin
                 rd_wd <= rd_wd + 17'd1;
                 if (DDRAM_DOUT_READY || rd_wd_fired) begin
@@ -120,8 +121,8 @@ always @(posedge DDRAM_CLK) begin
                 case(state)
                         3'b000:
                         begin
-                          // /55: reads first — read_req is edge-latched (the master is
-                          // already counting beats); a level-held write just waits.
+                          // Reads first: read_req is edge-latched and the master is
+                          // already counting beats, while a level-held write just waits.
                           if (read_req) begin
                             ram_address   <= mem_addr;
                             ram_read      <= 1'b1;
@@ -161,14 +162,15 @@ end
 
 assign DDRAM_BURSTCNT = ram_burst;   // STAGE 1: writes present their latched burst too (was WE ? 1 : ram_burst)
 assign DDRAM_BE       = ram_read ? 8'hFF : ram_be;
-// /51 RELOCATION: back to the standard MiSTer core DDR window at 0x30000000. The 0x1C000000
-// location (448MB, "Faster!") sits INSIDE Linux-managed RAM (mem=511M on stock MiSTer) — the
-// kernel hands those physical pages to processes/page-cache, and the FPGA + the HPS app
-// scribble them (and get scribbled): proven by the /49-/51 CRC fingerprints (foreign NLC/LZ4
-// stream bytes inside process heaps; FB rows zeroed by kernel pages). 0x30000000 is outside
-// System RAM (ends 0x1FEFFFFF) on every stock install. Its historical slowness was scaler-
-// traffic bank contention — measured again post-move via the selftest pacing telemetry.
-// MUST match groovy.cpp BASEADDR (deploy RBF + MiSTer_groovy together).
+// Relocated back to the standard MiSTer core DDR window at 0x30000000. The 0x1C000000
+// location (448MB, "Faster!") sits inside Linux-managed RAM (mem=511M on stock MiSTer), where
+// the kernel hands those physical pages to processes and the page cache, so the FPGA and the
+// HPS app scribble them and get scribbled in turn. CRC fingerprints confirmed it: foreign NLC
+// and LZ4 stream bytes turned up inside process heaps, and FB rows came back zeroed by kernel
+// pages. 0x30000000 is outside System RAM, which ends at 0x1FEFFFFF on every stock install.
+// Its historical slowness was scaler-traffic bank contention, re-measured after the move via
+// the selftest pacing telemetry.
+// Must match groovy.cpp BASEADDR (deploy RBF and MiSTer_groovy together).
 assign DDRAM_ADDR     = {4'b0011, ram_address[27:3]}; // RAM at 0x30000000
 //assign DDRAM_ADDR     = {6'b000111, ram_address[25:3]}; // RAM at 0x1C000000 (collides with Linux RAM)
 assign DDRAM_RD       = ram_read;

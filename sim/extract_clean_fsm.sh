@@ -1,12 +1,12 @@
 #!/bin/bash
-# extract_clean_fsm.sh — mechanically pull the blit/display FSM fragments from the PRISTINE
-# /mnt/c/git/_clean/Groovy_MiSTer/Groovy.sv into include files for the trustworthy frame-dumping sim.
-# We extract from the CLEAN repo (RAW + LZ4 + auto-blit, NO NLC, NO dbuf) so the calibration baseline
-# carries none of our modifications. Anchor-based + fail-loud (set -e + non-empty checks), like
-# tools/extract_fsm.sh — the sim always tests the current clean RTL, zero hand-copy drift.
+# extract_clean_fsm.sh: mechanically pull the blit and display FSM fragments out of a Groovy.sv into
+# include files for the frame-dumping sim. Point SRC at an upstream checkout (RAW, LZ4 and auto-blit,
+# with no NLC and no double buffer) to build a calibration baseline that carries none of our changes.
+# Anchor-based and fail-loud (set -e plus non-empty checks), like tools/extract_fsm.sh, so the sim
+# always tests the current RTL with no hand-copy drift.
 set -e
-# Default to THIS repo's own Groovy.sv (the fresh repo is clean today; once NLC states are added the sim sees
-# them and the NLC blit FSM gets extracted too — exactly what we want for the decode→display gate).
+# Default to this repo's own Groovy.sv. Once NLC states are present the sim sees them and the NLC blit FSM
+# is extracted too, which is what the decode-to-display gate needs.
 SRC="${SRC:-$(cd "$(dirname "$0")/.." && pwd)/Groovy.sv}"
 OUT="${1:-/tmp/clean_fsm_gen}"
 mkdir -p "$OUT"
@@ -31,6 +31,7 @@ awk 'f&&/^   endcase/{print "      endcase"; exit} /case \(state\)/{f=1} f{print
 echo "  states_all.vh: $(wc -l < "$OUT/states_all.vh") lines"
 # state-value + DDR localparams (single lines)
 grep "^parameter S_"   "$SRC" | sed 's/^parameter/localparam/' > "$OUT/states_params.vh"
+grep "^parameter .*AUTOBLIT_" "$SRC" | sed 's/^parameter/localparam/' >> "$OUT/states_params.vh"
 grep "^parameter DDR_" "$SRC" | sed 's/^parameter/localparam/' > "$OUT/ddr_params.vh"
 [ -s "$OUT/states_params.vh" ] && [ -s "$OUT/ddr_params.vh" ] || { echo "EXTRACT FAILED: params"; exit 1; }
 echo "  states_params.vh: $(wc -l < "$OUT/states_params.vh") lines"

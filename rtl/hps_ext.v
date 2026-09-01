@@ -42,7 +42,7 @@ module hps_ext
     output reg [1:0]  codec_mode = 0,   // 0=raw, 1=LZ4, 2=NLC. Decoded from the init command word [2:1].
     output reg [1:0]  nlc_near   = 0,   // NLC NEAR level (0=lossless, 1/2=near). Init word [4:3].
     output reg        nlc_color  = 1,   // NLC colour transform: 1=YCoCg-R (default), 0=RGB-direct. Init word [5].
-    output reg [1:0]  nlc_disp_mode = 0, // /46 NLC display path: 0=/45 stream, 1=B-throttle, 2=B-autonomous. Init word [7:6].
+    output reg [1:0]  nlc_disp_mode = 0, // NLC display path: 0=streaming, 1=throttled (retired), 2=autonomous. Init word [7:6].
     output reg        nlc_rice   = 0,   // R3: NLC entropy pack: 1=Golomb-Rice, 0=TILED (default). Init word [8].
     input             reset_switchres,
     output reg        cmd_switchres = 0,    
@@ -61,11 +61,12 @@ module hps_ext
 	 output reg        lz4_delta = 0,
     input      [31:0] lz4_uncompressed_bytes,
     output reg        cmd_blit_vsync = 0,
-    // /55-/56 wedge telemetry (GET_GROOVY_STATUS words 10-13; all PIPELINED regs in Groovy.sv)
+    // wedge telemetry (GET_GROOVY_STATUS words 10-13; all pipelined regs in Groovy.sv)
     input      [15:0] dbg_live_a,    // live: {ddram_state, mux_grant, eng_state, fsm_state}
     input      [15:0] dbg_live_b,    // live: done/ddto/wd counters + flags
     input      [15:0] dbg_frz_a,     // word12: freeze latch OR live eng_cur_frame
-    input      [15:0] dbg_frz_b      // word13: freeze context OR live {syncloss, flushed}
+    input      [15:0] dbg_frz_b,     // word13: freeze context OR live {syncloss, flushed}
+    input      [15:0] dbg_w14        // word14: longest starved-pixel run this session
 /* DEBUG
     input      [31:0]  PoC_subframe_wr_bytes,
     input             lz4_run,
@@ -121,8 +122,8 @@ reg        hps_vram_ready;
 
 reg[31:0]  hps_lz4_uncompressed_bytes;
 
-// /55 telemetry snapshot (same coherency treatment as the other status fields)
-reg[15:0]  hps_dbg_live_a, hps_dbg_live_b, hps_dbg_frz_a, hps_dbg_frz_b;
+// telemetry snapshot (same coherency treatment as the other status fields)
+reg[15:0]  hps_dbg_live_a, hps_dbg_live_b, hps_dbg_frz_a, hps_dbg_frz_b, hps_dbg_w14;
 
 reg[15:0]  m_temp;
 
@@ -201,6 +202,7 @@ always@(posedge clk_sys) begin
                                               hps_dbg_live_b     <= dbg_live_b;
                                               hps_dbg_frz_a      <= dbg_frz_a;
                                               hps_dbg_frz_b      <= dbg_frz_b;
+                                              hps_dbg_w14        <= dbg_w14;
 // DEBUG 
 /*
                                               hps_state <= state;
@@ -227,11 +229,12 @@ always@(posedge clk_sys) begin
                                            7: io_dout <= {8'd0, hps_vram_pixels[23:16]};                                           
                                            8: io_dout <= hps_lz4_uncompressed_bytes[15:0];
                                            9: io_dout <= hps_lz4_uncompressed_bytes[31:16];
-                                           // /55 wedge telemetry (read by groovy.cpp when compression is on)
+                                           // wedge telemetry (read by groovy.cpp when compression is on)
                                            10: io_dout <= hps_dbg_live_a;
                                            11: io_dout <= hps_dbg_live_b;
                                            12: io_dout <= hps_dbg_frz_a;
                                            13: io_dout <= hps_dbg_frz_b;
+                                           14: io_dout <= hps_dbg_w14;
 // DEBUG 
 /*
                                            10: io_dout <= hps_state;
@@ -277,7 +280,7 @@ always@(posedge clk_sys) begin
                                              codec_mode    <= m_temp[2:1];
                                              nlc_near      <= m_temp[4:3];
                                              nlc_color     <= m_temp[5];
-                                             nlc_disp_mode <= m_temp[7:6];   // /46 runtime NLC display mode
+                                             nlc_disp_mode <= m_temp[7:6];   // runtime NLC display mode
                                              nlc_rice      <= m_temp[8];     // R3: entropy pack (1=Golomb-Rice)
                                            end
                                          endcase 

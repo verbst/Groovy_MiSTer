@@ -65,7 +65,7 @@ static constexpr auto PS2_INPUTS_OPT = "[39:38]";
 static constexpr auto JOY_INPUTS_OPT = "[41:40]";
 // (no rumble option here: rumble is gated per pad in the Controllers page and globally by
 // MiSTer.ini RUMBLE. An OSD option used to live on [42] and silently shared that bit with
-// JUMBO_FRAMES_OPT above — see build_output/BUG_rumble_jumbo_status_bit42.md.)
+// JUMBO_FRAMES_OPT above, so toggling one changed the other.)
 static constexpr auto VERBOSE_OPT = "[28:27]";
 static constexpr auto BLIT_OPT = "[29]";
 static constexpr auto AUDIO_RATE_OPT = "[53:52]";
@@ -75,7 +75,8 @@ static constexpr auto LZ4_OPT = "[58]";
 static constexpr auto SERVER_TYPE_OPT = "[59]";
 // Idle timeout: close a session whose client has gone silent (killed/crashed/network drop) so the
 // CRT is freed instead of holding the last frame forever. HPS-only option on free bits [8:7]
-// (FPGA never wires them). 0=Off preserves the legacy infinite-hold. See the idle-timeout handoff.
+// (FPGA never wires them). 0=Off preserves the legacy infinite-hold. A client that is alive but
+// not blitting holds the session open by sending any datagram, CMD_GET_STATUS being the cheapest.
 static constexpr auto IDLE_TIMEOUT_OPT = "[8:7]";
 
 // FPGA SPI commands
@@ -89,9 +90,9 @@ static constexpr auto IDLE_TIMEOUT_OPT = "[8:7]";
 #define UIO_SET_GROOVY_BLIT_FIELD_LZ4 0xf8
 
 // FPGA DDR shared
-#define BASEADDR 0x30000000 // /51: standard MiSTer core DDR window, OUTSIDE Linux RAM.
-                                // 0x1C000000 sat inside mem=511M => kernel pages collided with
-                                // the FPGA/app buffer (the /49-/51 corruption). MUST match
+#define BASEADDR 0x30000000 // Standard MiSTer core DDR window, outside Linux RAM.
+                                // 0x1C000000 sat inside mem=511M, so kernel pages collided with
+                                // the FPGA/app buffer and corrupted it. Must match
                                 // rtl/ddram.sv's DDRAM_ADDR prefix (ship RBF+HPS together).
 #define HEADER_LEN 0xff
 #define CHUNK 7
@@ -122,8 +123,8 @@ static constexpr auto IDLE_TIMEOUT_OPT = "[8:7]";
 #endif
 
 // v2: CMD_INIT accepts the optional 6th byte (client caps, CAP_*). Clients
-// probe this with CMD_GET_VERSION before sending a len-6 init — pre-v2 cores
-// silently discard any CMD_INIT length they don't recognise.
+// probe this with CMD_GET_VERSION before sending a len-6 init, because pre-v2
+// cores silently discard any CMD_INIT length they don't recognise.
 #define GROOVY_VERSION 2
 
 // GroovyMiSTer protocol
@@ -149,6 +150,13 @@ static double difMs = 0;
 static unsigned long logTime = 0;
 static unsigned long verboseTime = 0;
 static FILE * fp = NULL;
+// Each session starts a fresh log by default, so one capture is one session. Append mode is the
+// old behaviour and is still selectable, because a fault that needs several reconnects to
+// reproduce loses its evidence if every CMD_INIT truncates the file. Select it with
+// GROOVY_LOG_APPEND in the environment, else /media/fat/groovy_log_append.cfg, same shape as
+// GROOVY_RECV_MODE.
+static uint8_t logAppend = 0;
+static uint32_t logSession = 0;
 
 #define LOG(sev,fmt, ...) do {	\
 			        if (sev == 0) printf(fmt, __VA_ARGS__);	\
@@ -351,7 +359,7 @@ static int blitCompression = 0;
 static uint8_t codecMode = 0;   // 0=raw 1=LZ4 2=NLC (from CMD_INIT byte[1] bits [1:0])
 static uint8_t nlcNear   = 0;   // NLC NEAR level (bits [3:2])
 static uint8_t nlcColor  = 1;   // NLC colour: 1=YCoCg (bit [4])
-static uint8_t nlcDispMode = 0; // /47 NLC display path: 0=/45 stream, 2=autonomous engine (bits [6:5])
+static uint8_t nlcDispMode = 0; // NLC display path: 0=streaming, 2=autonomous engine (bits [6:5])
 static uint8_t nlcPack   = 0;   // R3: NLC entropy pack: 1=Golomb-Rice, 0=TILED (CMD_INIT byte[1] bit 7)
 static uint8_t audioRate = 0;
 static uint8_t audioChannels = 0;
@@ -364,16 +372,18 @@ static int usingOldBlit = 0;
 static uint8_t hpsBlit = 0;
 static uint16_t numBlit = 0;
 
-// ---- /58 Phase 2: ingest receive modes --------------------------------------------------------
-// The blit hot path historically recvfrom()'d payloads DIRECTLY into the /dev/mem DDR window
-// (Device-uncached: shmem.cpp opens /dev/mem O_SYNC) — the kernel's copy into non-bufferable
-// memory is the measured ~38 MB/s ingest ceiling (/58: 527KB avg frames -> ~54fps effective).
+// ---- ingest receive modes ---------------------------------------------------------------------
+// The blit hot path historically recvfrom()'d payloads directly into the /dev/mem DDR window,
+// which is Device-uncached because shmem.cpp opens /dev/mem O_SYNC. The kernel's copy into
+// non-bufferable memory is the measured ~38 MB/s ingest ceiling; at 527KB average frames that
+// works out to about 54 fps.
 // GROOVY_RECV_MODE env or /media/fat/groovy_recv.cfg (single digit) selects at start:
 //   0 = legacy direct recvfrom into the DDR window (A/B baseline)
 //   1 = recvfrom into cached scratch + wide-store copy to the window (protocol-identical)
 //   2 = recvmmsg batch (up to RECV_BATCH dgrams/syscall) + wide-store copy + ONE FPGA blit
-//       notify per batch instead of per chunk (coarser watermark growth — proven safe: the
-//       engine promotes/finalizes per the /57 protocol invariant; end-of-frame notify unchanged)
+//       notify per batch instead of per chunk. Watermark growth is coarser, which is safe
+//       because the engine promotes and finalizes on its own invariant; end-of-frame notify
+//       is unchanged.
 #define RECV_BATCH 32
 static int recvMode = 1;
 static uint8_t recvNotifyDefer = 0;              // mode 2 batch loop defers per-chunk ASAP notifies
@@ -465,7 +475,7 @@ static uint32_t fpga_lz4_subframe_bytes = 0;
 static uint16_t fpga_lz4_subframe_blit = 0;
 */
 
-// /55-/56 wedge telemetry (GET_GROOVY_STATUS words 10-13)
+// Wedge telemetry (GET_GROOVY_STATUS words 10-13)
 // word10 (live_a): [7:0] blit FSM state, [11:8] NLC engine state, [13:12] ddr_mux2 grant
 //                  (0=M0 1=PEND 2=M1 3=DRAIN), [15:14] ddram state
 // word11 (live_b): [0] ddram read_req, [1] eng busy, [2] eng pend_valid, [3] freeze latched,
@@ -473,12 +483,56 @@ static uint16_t fpga_lz4_subframe_blit = 0;
 //                  [15:12] engine done_stb ROLLING count (publish rate: should tick ~1/poll)
 // word12: freeze latched ? freeze-time copy of word10 : engine cur_frame[15:0]
 // word13: freeze latched ? {vga_frame[11:0], audio, pend, busy, read_req} at the freeze
-//                        : {sync-loss count[3:0], engine FB flushed_bytes[15:4]}
+//                        : {sync-loss count[7:0], engine FB flushed_bytes[11:4]}
+// word14: longest starved-pixel run of the session (the red run length on screen)
 static uint16_t fpga_dbg_live_a = 0;
 static uint16_t fpga_dbg_live_b = 0;
 static uint16_t fpga_dbg_frz_a = 0;   // word12
 static uint16_t fpga_dbg_frz_b = 0;   // word13
+static uint16_t fpga_dbg_w14 = 0;     // word14
 static uint8_t  dbgFreezeLogged = 0;
+
+// Sync-loss watch. The core counts VRAM underruns (Groovy.sv dbg_syncloss_cnt, word13[15:12]
+// while no freeze is latched) and ddram read-watchdog fires (word11[11:8]), but the per-blit
+// vramSynced bit cannot see either: the condition self-clears within about one raster line, so a
+// once-per-frame sample almost always lands outside it. Sample the DBG words every blit and print
+// only when a counter moves. Steady state then costs no file I/O, which matters because per-blit
+// logging is itself HPS traffic inside the window being measured.
+static uint8_t  dbgSyncLossPrev = 0xff;   // 0xff = not yet primed
+static uint8_t  dbgDdrWdPrev = 0xff;
+static double   lastIngestMs = 0.0;       // previous frame's header-to-last-byte ingest
+static uint32_t lastIngestBytes = 0;
+
+// Housekeeping-gap probe. groovy_poll spins on the receive loop for a whole frame's ingest
+// (the isCorePriority do/while) and only then returns to the MiSTer main loop, so every deferred
+// piece of work lands in one burst right after the last payload byte. HPS and FPGA reach DDR
+// through the same hard memory controller, so that burst competes with the display refill, which
+// itself runs on about one raster line of slack. This measures the gap between leaving
+// groovy_poll and re-entering it, and where the raster was when it ended.
+static struct timespec pollExitTS = {0, 0};
+static double  hkGapMaxMs = 0.0;
+static unsigned long hkDumpTime = 0;
+// Every gap is bucketed and the distribution dumped periodically. Reporting new maxima alone is
+// not enough: one early spike raises the bar for the rest of the session, and a quiet window then
+// looks the same as a window where the probe stopped reporting.
+#define HK_BUCKETS  8
+#define HK_DUMP_MS  10000
+static uint32_t hkBucket[HK_BUCKETS] = {0};
+static uint16_t hkMaxVc = 0;   // raster line when the worst gap ended
+
+static inline int hk_bucket(double ms)
+{
+	if (ms < 0.05) return 0;
+	if (ms < 0.10) return 1;
+	if (ms < 0.20) return 2;
+	if (ms < 0.50) return 3;
+	if (ms < 1.00) return 4;
+	if (ms < 2.00) return 5;
+	if (ms < 5.00) return 6;
+	return 7;
+}
+
+
 
 static inline void initDDR()
 {
@@ -486,14 +540,18 @@ static inline void initDDR()
 }
 
 
-static void initVerboseFile()
+static void openVerboseFile(uint8_t sessionStart)
 {
-	// fp lives for the whole HPS process lifetime (never fclose()'d). This is called again on
-	// every CMD_INIT while doVerbose is on (including reconnects from a USB hotplug stall) - guard
-	// against re-opening in "wt" (truncate) mode each time, or every reconnect wipes out the exact
-	// evidence needed to diagnose it. Only the first call (process startup, or the first CMD_INIT
-	// if verbose was toggled on after boot) actually creates/truncates the file.
-	if (fp) return;
+	// Only a session start may truncate. Every other caller is idempotent and can never discard a
+	// capture mid-run: that covers server start, and the probes, which open the file themselves so
+	// they still work with Verbose off. In append mode nothing truncates after the first open,
+	// giving the old behaviour of one file per boot that survives reconnects.
+	if (fp)
+	{
+		if (!sessionStart || logAppend) return;
+		fclose(fp);
+		fp = NULL;
+	}
 	fp = fopen(GROOVY_LOG_PATH, "wt");
 	if (!fp)
 	{
@@ -518,7 +576,7 @@ static void initVerboseFile()
 static void groovy_FPGA_hps()
 {	                   
     doVerbose = (uint8_t) user_io_status_get(VERBOSE_OPT);        
-    initVerboseFile();
+    openVerboseFile(0);
     
     hpsBlit = (uint8_t) user_io_status_get(BLIT_OPT); 
     doScreensaver = (uint8_t) !user_io_status_get(SCREENSAVER_OPT); 
@@ -594,11 +652,12 @@ static void groovy_FPGA_status(uint8_t isACK)
 	{
 		fpga_lz4_uncompressed  = spi_w(0) | spi_w(0) << 16;
 
-		// /55 wedge telemetry (must mirror hps_ext.v words 10-13 exactly)
+		// wedge telemetry (must mirror hps_ext.v words 10-13 exactly)
 		fpga_dbg_live_a = spi_w(0);
 		fpga_dbg_live_b = spi_w(0);
 		fpga_dbg_frz_a  = spi_w(0);
 		fpga_dbg_frz_b  = spi_w(0);
+		fpga_dbg_w14    = spi_w(0);
 
 		if ((fpga_dbg_live_b & 0x0008) && !dbgFreezeLogged)
 		{
@@ -696,8 +755,8 @@ static void groovy_FPGA_init(uint8_t cmd, uint8_t audio_rate, uint8_t audio_chan
         cmd_word |= (uint16_t)(codecMode & 0x3) << 1;
         cmd_word |= (uint16_t)(nlcNear   & 0x3) << 3;
         cmd_word |= (uint16_t)(nlcColor  & 0x1) << 5;
-        cmd_word |= (uint16_t)(nlcDispMode & 0x3) << 6;   // /47: hps_ext decodes m_temp[7:6] = nlc_disp_mode
-        cmd_word |= (uint16_t)(nlcPack   & 0x1) << 8;     // R3: hps_ext m_temp[8] = nlc_rice (Golomb-Rice pack)
+        cmd_word |= (uint16_t)(nlcDispMode & 0x3) << 6;   // hps_ext decodes m_temp[7:6] = nlc_disp_mode
+        cmd_word |= (uint16_t)(nlcPack   & 0x1) << 8;     // hps_ext m_temp[8] = nlc_rice (Golomb-Rice pack)
     }
     spi_w(cmd_word);
     bitByte bits;
@@ -890,9 +949,10 @@ static void setSwitchres(char *recvbuf)
     poc->PoC_VS = udp_vend - udp_vbegin;
     poc->PoC_VBP = udp_vtotal - udp_vend;
     
-    // ce_pix chooser: clk_sys = pclock * ce_pix. BOUND clk_sys <= ~83MHz — the FPGA's timing is analyzed at the
-    // PLL's configured 82.75MHz (the runtime PLL reconfig is invisible to STA); the old unbounded ladder produced
-    // 100.7MHz at 25.175MHz (31kHz 480p) = a 22% overclock = no sync at all (/42), and 87.9MHz at 14.655MHz (480i).
+    // ce_pix chooser: clk_sys = pclock * ce_pix. clk_sys is bounded to ~83MHz because the FPGA's timing is
+    // analyzed at the PLL's configured 82.75MHz, the runtime PLL reconfig being invisible to STA. The old
+    // unbounded ladder produced 100.7MHz at 25.175MHz (31kHz 480p), a 22% overclock that gave no sync at all,
+    // and 87.9MHz at 14.655MHz (480i).
     // Keep >=40MHz for the vga scaler; the NLC decoder needs >= ~2.1*pclock (ce_pix>=3 always satisfies it).
     poc->PoC_ce_pix = (udp_pclock * 16 < 84) ? 16 : (udp_pclock * 12 < 84) ? 12 : (udp_pclock * 8 < 84) ? 8 : (udp_pclock * 6 < 84) ? 6 : (udp_pclock * 4 < 84) ? 4 : (udp_pclock * 3 < 84) ? 3 : 2;
     poc->PoC_interlaced = (udp_interlace >= 1) ? 1 : 0;
@@ -1331,14 +1391,14 @@ static void setInit(uint8_t compression, uint8_t audio_rate, uint8_t audio_chan,
 {
 	difMs = 0;
 	fpga_lz4_uncompressed = 0;
-	dbgFreezeLogged = 0;   // /55: re-arm the one-shot FREEZE_LATCH log per session
+	dbgFreezeLogged = 0;   // re-arm the one-shot FREEZE_LATCH log per session
 	// CMD_INIT byte[1] packs codec + NLC params: [1:0]=codec (0=raw,1=LZ4,2=NLC) [3:2]=NEAR [4]=colour(1=YCoCg)
-	// [6:5]=dispMode [7]=RICE pack (R3).
+	// [6:5]=dispMode [7]=RICE pack.
 	codecMode       = compression & 0x3;
 	nlcNear         = (compression >> 2) & 0x3;
 	nlcColor        = (compression >> 4) & 0x1;
-	nlcDispMode     = (compression >> 5) & 0x3;   // /47: NLC display mode -> FPGA init word [7:6]
-	nlcPack         = (compression >> 7) & 0x1;   // R3: entropy pack -> FPGA init word [8]
+	nlcDispMode     = (compression >> 5) & 0x3;   // NLC display mode -> FPGA init word [7:6]
+	nlcPack         = (compression >> 7) & 0x1;   // entropy pack -> FPGA init word [8]
 	if (codecMode > 2) codecMode = 0;
 	blitCompression = (codecMode >= 1) ? 1 : 0;   // LZ4 AND NLC use the LZ DDR zones + compressed blit path
 	audioRate = (audio_rate <= 3) ? audio_rate : 0;
@@ -1391,9 +1451,9 @@ static void setInit(uint8_t compression, uint8_t audio_rate, uint8_t audio_chan,
   		{
 			// drain ALL queued subscribe datagrams and keep the LAST one's
 			// source address: a reconnecting client (new ephemeral port) may
-			// sit behind stale subscribes from an earlier session — reading
-			// just one used to latch a dead address and stream joysticks
-			// nowhere on 2nd+ launch
+			// sit behind stale subscribes from an earlier session. Reading
+			// just one latched a dead address and streamed joysticks nowhere
+			// from the second launch onwards.
 			int l;
 			while ((l = recvfrom(sockfdInputs, recvbuf, 1, 0, (struct sockaddr *)&clientaddrInputs, &clilen)) > 0)
 			{
@@ -1420,6 +1480,12 @@ static void setInit(uint8_t compression, uint8_t audio_rate, uint8_t audio_chan,
  	user_io_status_set(LZ4_OPT, (uint32_t)blitCompression);
  	
 	groovy_FPGA_init(1, audioRate, audioChannels, rgbMode);
+
+	dbgSyncLossPrev = 0xff;   // core clears its counters on CMD_INIT; re-prime the watch
+	dbgDdrWdPrev = 0xff;
+	hkGapMaxMs = 0.0;         // report a fresh worst case per session, not per boot
+	memset(hkBucket, 0, sizeof(hkBucket));
+	hkDumpTime = GetTimer(HK_DUMP_MS);
 }
 
 static void setBlit(uint32_t udp_frame, uint8_t udp_field, uint32_t udp_lz4_size, uint8_t udp_frame_delta)
@@ -1484,18 +1550,54 @@ static void setBlit(uint32_t udp_frame, uint8_t udp_field, uint32_t udp_lz4_size
 		poc->PoC_bytes_lz4_ddr = 0;
 	}		
 
+	uint8_t dbgRead = 0;
 	if (doVerbose > 0 && doVerbose < 3)
 	{
 		groovy_FPGA_status(0);
+		dbgRead = 1;
 		LOG(1, "[GET_STATUS][DDR fr=%d bl=%d][GPU fr=%d vc=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][AUDIO=%d][LZ4 inf=%d][DBG %04x %04x %04x %04x]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_frame, fpga_vga_vcount, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_audio, fpga_lz4_uncompressed, fpga_dbg_live_a, fpga_dbg_live_b, fpga_dbg_frz_a, fpga_dbg_frz_b);
+	}
+	else if (blitCompression)
+	{
+		groovy_FPGA_status(0);   // DBG words sit past the ACK-sized read; needed by the watch below
+		dbgRead = 1;
 	}
 
 	if (!doVerbose && !fpga_vram_synced)
  	{
- 		groovy_FPGA_status(0);
+ 		if (!dbgRead) groovy_FPGA_status(0);
  		LOG(0, "[GET_STATUS][DDR fr=%d bl=%d][GPU fr=%d vc=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][AUDIO=%d][LZ4 inf=%d][DBG %04x %04x %04x %04x]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_frame, fpga_vga_vcount, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_audio, fpga_lz4_uncompressed, fpga_dbg_live_a, fpga_dbg_live_b, fpga_dbg_frz_a, fpga_dbg_frz_b);
  	}	
  	
+	if (dbgRead)
+	{
+		uint8_t frozen = (fpga_dbg_live_b >> 3) & 0x1;             // freeze latched -> word13 is the freeze context
+		uint8_t sl     = frozen ? dbgSyncLossPrev : (uint8_t)((fpga_dbg_frz_b >> 8) & 0xff);
+		uint8_t wd     = (uint8_t)((fpga_dbg_live_b >> 8) & 0xf);
+		if (dbgSyncLossPrev == 0xff)
+		{
+			dbgSyncLossPrev = sl;
+			dbgDdrWdPrev = wd;
+		}
+		else if (sl != dbgSyncLossPrev || wd != dbgDdrWdPrev)
+		{
+			openVerboseFile(0);
+			// starve_px is the worst frame's starved-pixel count, which is the red run length on
+			// screen and therefore the stall duration in pixel clocks. It converts straight into
+			// the stall the display suffered:
+			//     stall in lines = AUTOBLIT_LEAD + starve_px / active_width
+			// A starve_px of 0 means the lead absorbed the whole stall; a large value says by how
+			// much the lead would have to be raised to absorb it.
+			LOG(0, "[SYNCLOSS][syncloss=%u(+%d) ddrwd=%u][starve_px=%u][GPU fr=%u vc=%u vb=%u fskip=%u][prev ingest=%06.3fms csize=%u]\n",
+			    sl, (int) sl - (int) dbgSyncLossPrev, wd, fpga_dbg_w14,
+			    fpga_vga_frame, fpga_vga_vcount, fpga_vga_vblank, fpga_vga_frameskip,
+			    lastIngestMs, lastIngestBytes);
+			if (sl == 0xff) LOG(0, "[SYNCLOSS][counter SATURATED, further events are not counted]%s\n", "");
+			dbgSyncLossPrev = sl;
+			dbgDdrWdPrev = wd;
+		}
+	}
+
  	if (!poc->PoC_bytes_recv)
  	{
  		clock_gettime(CLOCK_MONOTONIC, &blitStart);
@@ -1590,6 +1692,8 @@ static void setBlitLZ4(uint16_t len)
         	poc->PoC_buffer_offset = 0;		
 		clock_gettime(CLOCK_MONOTONIC, &blitStop);        	
         	double difBlit = diff_in_ms(&blitStart, &blitStop);
+		lastIngestMs    = difBlit;                       // paired with the next blit's sync-loss check
+		lastIngestBytes = (uint32_t) poc->PoC_bytes_lz4_len;
 		LOG(1, "[LZ4_BLIT][TOTAL %06.3f][(%d) Bytes=%d]\n", difBlit, numBlit, poc->PoC_bytes_lz4_len);
         }
 }
@@ -1612,7 +1716,7 @@ static void groovy_map_ddr()
     	isCorePriority = 0;
     	isBlitting = 0;
 
-	// /58 Phase 2 one-shot diagnostic: raw store bandwidth into the uncached window (the
+	// One-shot diagnostic: raw store bandwidth into the uncached window (the
 	// platform ceiling the recv modes work against). 256KB of 8-byte stores into LZ4 zone D
 	// (init-time scratch; real sessions overwrite it).
 	{
@@ -2245,10 +2349,9 @@ static inline void process_packet(char *recvbufPtr, int len)
 				{
 					if (len == 4 || len == 5 || len == 6)
 					{
-						if (doVerbose)
-						{
-							initVerboseFile();
-						}
+						openVerboseFile(1);   // session start: truncates unless append is on
+						logSession++;
+						LOG(0, "[SESSION][%u][verbose=%d append=%d]\n", logSession, doVerbose, logAppend);
 						uint8_t compression = recvbufPtr[1];
 						uint8_t audio_rate = recvbufPtr[2];
 						uint8_t audio_channels = recvbufPtr[3];
@@ -2636,7 +2739,7 @@ static void groovy_start()
 		// get HPS Server Settings
 		groovy_FPGA_hps();
 
-		// /58 Phase 2: ingest receive mode (env overrides the cfg file; default 1 = cached bounce)
+		// ingest receive mode (env overrides the cfg file; default 1 = cached bounce)
 		{
 			const char *rm = getenv("GROOVY_RECV_MODE");
 			char rmbuf[8] = {0};
@@ -2654,6 +2757,20 @@ static void groovy_start()
 			if (recvMode == 2) recvMode = 1;         // no recvmmsg on this libc: degrade to bounce
 #endif
 			printf("Groovy recv mode %d\n", recvMode);
+
+			const char *la = getenv("GROOVY_LOG_APPEND");
+			char labuf[8] = {0};
+			if (!la)
+			{
+				FILE *lf = fopen("/media/fat/groovy_log_append.cfg", "r");
+				if (lf)
+				{
+					if (fgets(labuf, sizeof(labuf), lf)) la = labuf;
+					fclose(lf);
+				}
+			}
+			if (la && la[0] == '1') logAppend = 1;
+			printf("Groovy log append %d\n", logAppend);
 		}
 #ifdef MSG_WAITFORONE
 		if (!recvBatchReady)
@@ -2790,6 +2907,35 @@ void groovy_poll()
 		return;
 	}
 
+	if (isConnected && pollExitTS.tv_sec)
+	{
+		struct timespec hkNow;
+		clock_gettime(CLOCK_MONOTONIC, &hkNow);
+		double hkGapMs = diff_in_ms(&pollExitTS, &hkNow);
+		hkBucket[hk_bucket(hkGapMs)]++;
+		if (hkGapMs > hkGapMaxMs)
+		{
+			hkGapMaxMs = hkGapMs;
+			groovy_FPGA_status(1);   // 4-word read, and only on a new worst case
+			hkMaxVc = fpga_vga_vcount;
+		}
+		if (CheckTimer(hkDumpTime))
+		{
+			openVerboseFile(0);   // capture without turning on per-blit verbose logging
+			// verbose= is the live OSD Verbose level. Only level 0 gives an undisturbed measurement:
+			// at level 1 the per-blit GET_STATUS logging adds thousands of writes inside the window
+			// being measured. Stamping the level into the line makes each log say for itself whether
+			// the capture was clean.
+			LOG(0, "[HKGAP][verbose=%d][poll-gap ms over %us][max=%06.3fms at vc=%u][<.05=%u .05-.1=%u .1-.2=%u .2-.5=%u .5-1=%u 1-2=%u 2-5=%u >=5=%u]\n",
+			    doVerbose, HK_DUMP_MS / 1000, hkGapMaxMs, hkMaxVc,
+			    hkBucket[0], hkBucket[1], hkBucket[2], hkBucket[3],
+			    hkBucket[4], hkBucket[5], hkBucket[6], hkBucket[7]);
+			memset(hkBucket, 0, sizeof(hkBucket));
+			hkDumpTime = GetTimer(HK_DUMP_MS);
+		}
+	}
+
+
 	// Verbose is the one OSD option honoured live. The rest stay latched at server start
 	// (the "Save and reload to apply!" line in CONF_STR) because they gate socket creation,
 	// but logging has to be switchable while a fault is actually happening. Rate-limited
@@ -2801,11 +2947,11 @@ void groovy_poll()
 	}
 
 	// client->server traffic on the inputs socket, one non-blocking sweep per
-	// poll. Address-aware: len==1 is an input (re)subscribe — refresh the
-	// stored client address so the joystick/ps2 stream always follows the
-	// CURRENT client (a reconnecting client with a fresh source port used to
-	// be stuck behind the one-shot CMD_INIT read; and the old rumble-only
-	// sweep silently ATE re-subscribes without updating the address).
+	// poll. Address-aware: len==1 is an input (re)subscribe, which refreshes
+	// the stored client address so the joystick and ps2 streams always follow
+	// the current client. A reconnecting client with a fresh source port was
+	// previously stuck behind the one-shot CMD_INIT read, and the old
+	// rumble-only sweep consumed re-subscribes without updating the address.
 	// len==4 is rumble, CAP_RUMBLE sessions only.
 	if (isConnected && (doJoyInputs || doPs2Inputs) && !doXDPServer)
 	{
@@ -2855,9 +3001,10 @@ void groovy_poll()
 #ifdef MSG_WAITFORONE
 			if (recvMode == 2)
 			{
-				// /58 mode 2: drain everything queued in ONE syscall; per-message processing
-				// keeps exact legacy ordering/semantics (commands, ACKs, completion notifies
-				// run inline); the per-chunk ASAP watermark notify is deferred to ONE per batch.
+				// mode 2: drain everything queued in one syscall. Per-message processing keeps
+				// the exact legacy ordering and semantics, with commands, ACKs and completion
+				// notifies running inline; only the per-chunk watermark notify is deferred to
+				// one per batch.
 				for (int i = 0; i < RECV_BATCH; i++) recvMsgs[i].msg_hdr.msg_namelen = sizeof(recvAddrs[i]);
 				int n = recvmmsg(sockfd, recvMsgs, RECV_BATCH, MSG_WAITFORONE, NULL);
 				if (n > 0) gotData = 1;
@@ -2889,8 +3036,8 @@ void groovy_poll()
 #endif
 			if (recvMode == 1 && isBlitting)
 			{
-				// /58 mode 1: cached bounce + wide-store copy (protocol-identical to mode 0 —
-				// same per-chunk notifies; only the payload's route into the window changes)
+				// mode 1: cached bounce plus wide-store copy. Protocol-identical to mode 0,
+				// with the same per-chunk notifies; only the payload's route into the window changes.
 				int len = recvfrom(sockfd, (char *) &recvbuf[0], 65536, 0, (struct sockaddr *)&clientaddr, &clilen);
 				if (len > 0) gotData = 1;
 				if (len > 0)
@@ -2933,8 +3080,8 @@ void groovy_poll()
 
 	// idle timeout (once per poll): refresh the deadline if any datagram arrived this poll, else close
 	// a session whose client has gone silent (killed/crashed/network drop). A client that is alive but
-	// not blitting keeps the session by sending CMD_GET_STATUS (or any datagram) - see the keepalive
-	// contract in the integration handoff. No-op when disabled (idleTimeoutMs==0) or disconnected.
+	// not blitting keeps the session alive by sending CMD_GET_STATUS, or any other datagram.
+	// No-op when disabled (idleTimeoutMs==0) or disconnected.
 	if (isConnected && idleTimeoutMs)
 	{
 		if (sawActivity)
@@ -2950,7 +3097,13 @@ void groovy_poll()
 		}
 	}
 
-	if (fp && doVerbose > 0 && CheckTimer(logTime))
+	clock_gettime(CLOCK_MONOTONIC, &pollExitTS);   // start of the housekeeping gap
+
+	// Flush whenever the file is open, not only when verbose is on. The probes open it
+	// themselves so they work with Verbose off, and at that level they write a few KB across a
+	// whole run, under the stdio buffer threshold, so nothing ever reached disk and the log was
+	// empty when the process was killed.
+	if (fp && CheckTimer(logTime))
    	{
 		fflush(fp);
 		logTime = GetTimer(LOG_TIMER);

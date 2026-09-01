@@ -1,3 +1,0 @@
-Vclean_disp_tb___024root__DepSet_h7ea8cc27__0.o: \
- Vclean_disp_tb___024root__DepSet_h7ea8cc27__0.cpp Vclean_disp_tb__pch.h \
- Vclean_disp_tb___024root.h

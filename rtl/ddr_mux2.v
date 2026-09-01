@@ -1,33 +1,34 @@
 //
-// ddr_mux2.v — 2-master transaction-atomic arbiter for ddram's mem_* port (/47 NLC Mode 2).
+// ddr_mux2.v: 2-master transaction-atomic arbiter for ddram's mem_* port (NLC mode 2).
 //
-// M0 = the Groovy blit FSM (legacy, PRIORITY): its port is BIT-TRANSPARENT whenever it has
-//      anything in flight — the grant only moves when M0 is provably quiescent, so the FSM's
-//      pulse/level DDR idioms are preserved untouched (zero-perturbation by construction).
+// M0 = the Groovy blit FSM (legacy, and it has priority): its port is bit-transparent whenever
+//      it has anything in flight. The grant only moves when M0 is provably quiescent, so the
+//      FSM's pulse and level DDR idioms are preserved untouched, by construction.
 // M1 = the NLC decode engine (explicit req/gnt handshake; drives the port only while gnt=1,
 //      holds m1_req through a whole transaction, drops it between transactions).
 //
-// GRANT RULES — derived from the FSM's request idioms (all sites audited):
-//   * every ddr_data_req (read) is asserted exactly ONE cycle after a same-state `!ddr_busy`
+// Grant rules, derived from the FSM's request idioms (all sites audited):
+//   * every ddr_data_req (read) is asserted exactly one cycle after a same-state `!ddr_busy`
 //     check, and is dropped once the FSM observes busy=1 ("request latched");
-//   * every ddr_data_write is LEVEL-HELD until the FSM observes `!ddr_busy` acceptance.
+//   * every ddr_data_write is level-held until the FSM observes `!ddr_busy` acceptance.
 // Therefore:
 //   * G_M0 -> G_PEND only when M0 is idle THIS cycle (!m0_rd && !m0_wr && !mem_busy) and M1
 //     wants the bus.
-//   * G_PEND (>=1 cycle): m0_busy is FORCED high, so no FSM state can take a new `!ddr_busy`
-//     decision. A request decided in the LAST G_M0 cycle lands here: reads PASS THROUGH (the
-//     ddram edge-detect must not miss the pulse) and CANCEL the switch; writes are BLOCKED
-//     (level-held upstream — a blocked write just waits one cycle) and CANCEL the switch.
-//     If M0 stays quiet and the bus is free, grant M1.
-//   * G_M1: M0 sees busy=1 (writes hold; reads cannot be issued — the FSM never saw !busy).
-//   * G_DRAIN: entered the moment M1 drops m1_req. m1_gnt falls combinationally with m1_req
-//     (never stale), a new m1_req is IGNORED here (one transaction per grant — M1 must win a
-//     fresh arbitration round through G_M0/G_PEND, so M0's priority is structural), and the
-//     grant returns to M0 once the bus has drained.
+//   * G_PEND (one cycle or more): m0_busy is forced high, so no FSM state can take a new
+//     `!ddr_busy` decision. A request decided in the last G_M0 cycle lands here: reads pass
+//     through, because the ddram edge-detect must not miss the pulse, and cancel the switch;
+//     writes are blocked, being level-held upstream so a blocked write just waits one cycle,
+//     and also cancel the switch. If M0 stays quiet and the bus is free, grant M1.
+//   * G_M1: M0 sees busy=1, so writes hold and reads cannot be issued, the FSM never having
+//     seen !busy.
+//   * G_DRAIN: entered the moment M1 drops m1_req. m1_gnt falls combinationally with m1_req so
+//     it is never stale, a new m1_req is ignored here (one transaction per grant: M1 must win a
+//     fresh arbitration round through G_M0 and G_PEND, which makes M0's priority structural),
+//     and the grant returns to M0 once the bus has drained.
 // A write burst can never be split: entering G_PEND requires !m0_wr, and ddram consumes burst
 // continuation beats only from the owner that keeps mem_wr asserted through the last beat.
 //
-// M1 CONTRACT: hold m1_req through the WHOLE transaction (all read beats received / all write
+// M1 contract: hold m1_req through the whole transaction (all read beats received, or all write
 // beats accepted), drop it after; issue rd/wr only while m1_gnt=1.
 //
 module ddr_mux2
@@ -63,7 +64,7 @@ module ddr_mux2
         input         mem_busy,
         input         mem_dready,
 
-        output [1:0]  dbg_grant          // /55 telemetry: current grant state
+        output [1:0]  dbg_grant          // telemetry: current grant state
 );
 
 localparam G_M0 = 2'd0, G_PEND = 2'd1, G_M1 = 2'd2, G_DRAIN = 2'd3;
@@ -82,7 +83,7 @@ always @(posedge clk) begin
 end
 
 // request path: M1 owns it in G_M1 and G_DRAIN (residual beats); M0 owns it in G_M0 and
-// G_PEND (reads must pass in PEND; writes blocked there — level-held upstream)
+// G_PEND (reads must pass in PEND; writes are blocked there, being level-held upstream)
 wire m1_owns = (g == G_M1) || (g == G_DRAIN);
 assign mem_addr  = m1_owns ? m1_addr  : m0_addr;
 assign mem_din   = m1_owns ? m1_din   : m0_din;
@@ -98,7 +99,7 @@ assign m1_dready = m1_owns ? mem_dready : 1'b0;
 assign m1_gnt    = (g == G_M1) && m1_req;             // falls WITH req: a new request can never see a stale grant
 
 // synthesis translate_off
-// invariant: M0 must never issue a read while granted away — every FSM read follows a !busy
+// invariant: M0 must never issue a read while granted away. Every FSM read follows a !busy
 // observation, which G_PEND/G_M1 make impossible. If this ever fires, an unguarded request
 // site slipped in and its pulse was lost (deadlock upstream).
 always @(posedge clk) if (m1_owns && m0_rd) $display("[DDRMUX2-VIOLATION] m0_rd while granted to M1 at %0t", $time);

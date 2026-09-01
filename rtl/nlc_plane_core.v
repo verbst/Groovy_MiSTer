@@ -1,9 +1,9 @@
-// nlc_plane_core.v — ONE plane of the parallel NLC decoder (STAGE B / wire-format v2).
+// nlc_plane_core.v: one plane of the parallel NLC decoder (stage B, wire format v2).
 //
 // Owns: a 2-bank compressed-SEGMENT buffer (the line loader word-routes this plane's
 // byte-aligned segment into the inactive bank), an LSB-first bit reader over it, the
 // tile width-header register, the 2-cycle MED recurrence (stage A predict / stage B
-// dequant+clamp — the proven nlc_decode.v timing split), and the per-plane above-line
+// dequant and clamp, the same timing split nlc_decode.v uses), and the per-plane above-line
 // double buffer (the proven M10K recipe: combinational 1-ahead read address, registered
 // read data with NO reset).
 //
@@ -57,7 +57,7 @@ module nlc_plane_core #(
     // acc holds up to 127 valid bits; refill 64 at a time from the staged next-word `nxt`
     // whenever <=63 remain (63+64=127 fits exactly). R2 sizing: the worst RICE sample code
     // is 19 zeros + stop + k(<=15) = 35 bits (escape = 20+1+12 = 33), vs TILED's <=15.
-    // Invariant (proved inductively): at every stage-A entry bitcnt >= 64 — the preceding
+    // Invariant (proved inductively): at every stage-A entry bitcnt >= 64, because the preceding
     // stage-B either refilled (post-A residue >= 0, +64) or held > 63; and the tile-header
     // path only subtracts WBITS=4 in between. So every sample decodes in ONE consume and
     // the 2-cycle A/B cadence is preserved for BOTH packs. rdy (>=39 = worst hdr+sample
@@ -81,7 +81,7 @@ module nlc_plane_core #(
 
     // ---- above-line double buffer (the proven M10K recipe) -----------------------------
     (* ramstyle = "M10K" *) reg signed [11:0] bufP [0:2*MAXW-1];
-    reg signed [11:0] bufP_q;             // registered read data — NO reset (M10K inference)
+    reg signed [11:0] bufP_q;             // registered read data, with no reset (M10K inference)
     reg  [15:0] ra;                       // combinational, aimed one column ahead
     wire [15:0] co = lp ? MAXW[15:0] : 16'd0;   // cur  bank offset
     wire [15:0] po = lp ? 16'd0 : MAXW[15:0];   // prev bank offset (above)
@@ -125,7 +125,7 @@ module nlc_plane_core #(
             end
 
             // ---------------- consume + refill (blocking scratch) ---------------
-            // NB: skipped entirely on a prime cycle — the trailing acc/bitcnt update
+            // Skipped entirely on a prime cycle, because the trailing acc/bitcnt update
             // would otherwise CLOBBER the prime's reset with stale pre-prime bits.
             if (!prime) begin
             cons = 6'd0;
@@ -196,7 +196,7 @@ module nlc_plane_core #(
             end   // !prime
         end
 
-        // registered above-line read (outside reset — M10K recipe, no reset)
+        // registered above-line read (outside reset: the M10K recipe needs no reset)
         bufP_q <= bufP[ra];
     end
 

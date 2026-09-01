@@ -1,28 +1,28 @@
-// nlc_engine.v — /47 NLC Mode 2: the AUTONOMOUS decode engine.
+// nlc_engine.v: NLC mode 2, the autonomous decode engine.
 //
 // Runs the whole NLC frame pipeline (compressed feed -> decoder -> chunk accumulator -> FB
 // burst writes) as a background DDR master, so the Groovy blit FSM never time-shares with the
-// decode: the FSM keeps running the display (auto-blit/frameskip from the FB) concurrently —
-// the RAW-identical display architecture. This removes the decode-XOR-display serialization
-// that every historical NLC display defect traced back to.
+// decode. The FSM keeps running the display (auto-blit and frameskip from the FB) concurrently,
+// which is the same display architecture RAW uses. This removes the decode-or-display
+// serialization that every historical NLC display defect traced back to.
 //
-// Deliberately PoC-free: the FSM pre-computes and hands over plain addresses/sizes
-// (src zone base, dst FB base, frame byte count), so field/interlace/double-buffer policy
-// stays in ONE place (the FSM). The engine is a pure data mover.
+// Deliberately PoC-free: the FSM pre-computes and hands over plain addresses and sizes
+// (src zone base, dst FB base, frame byte count), so field, interlace and double-buffer policy
+// all stay in one place, the FSM. The engine is a pure data mover.
 //
 // Interfaces:
 //  * announce/adopt: the FSM latches the newest announce into pend_* (newest-wins while the
-//    engine is busy = the proven /37 finish-once-started policy); the engine adopts when idle
+//    engine is busy, the established finish-once-started policy); the engine adopts when idle
 //    (adopt_ack pulse). Same-frame chunk growth arrives via wm_stb/wm_bytes/wm_final (the FSM
 //    pulses it only after matching cur_frame).
-//  * decoder: drives the EXISTING u_nlc instance through mode-2 input muxes (one decoder for
-//    all modes — no M10K duplication). dec_oready and the chunk commit are the SAME expression
-//    (the Stage-1 lesson: gating them differently loses a popped word).
+//  * decoder: drives the existing u_nlc instance through mode-2 input muxes, so one decoder
+//    serves all modes with no M10K duplication. dec_oready and the chunk commit must be the
+//    same expression; gating them differently loses a popped word.
 //  * DDR: master 1 of rtl/ddr_mux2.v. Holds m_req through a whole transaction, drops it after
 //    (the arbiter re-arbitrates from scratch => the display FSM has structural priority).
-//    Feed bursts <=128 words; flush bursts <=NLC_CHUNK beats — worst-case FSM wait ~1.3us,
-//    50x under the 63.5us line budget.
-//  * liveness: the engine can NEVER wedge the display (it is off the display path entirely),
+//    Feed bursts <=128 words and flush bursts <=NLC_CHUNK beats, so the worst-case FSM wait
+//    is about 1.3us, 50x under the 63.5us line budget.
+//  * liveness: the engine can never wedge the display, being off the display path entirely,
 //    but it still carries a bounded escape: if the input is exhausted-and-final (or a newer
 //    frame waits while this one starves >2^20 cycles ~12.7ms) the frame force-completes
 //    (flush partial, publish only if final) and the engine returns to idle. wd_fired flags it.
@@ -83,7 +83,7 @@ module nlc_engine #(
         output     [3:0]  eng_state         // telemetry
 );
 
-localparam NLC_CHUNK = 8'd120;              // words per FB burst (960 B) — the proven Stage-1 size
+localparam NLC_CHUNK = 8'd120;              // words per FB burst (960 B), the established chunk size
 
 localparam E_IDLE   = 4'd0,
            E_RST    = 4'd1,                 // decoder reset + let the FSM settle the adopt handshake
@@ -102,7 +102,7 @@ assign eng_state = st;
 reg [31:0] cur_size, cur_wm;
 reg        cur_final;
 reg [27:0] cur_src, cur_dst, cur_fb_bytes;
-reg        end_publish;                     // publish (done_stb) on completion — cleared on abandon
+reg        end_publish;                     // publish (done_stb) on completion; cleared on abandon
 
 // ---- chunk accumulator (M10K recipe: no reset on the q reg, combinational 1-ahead address)
 (* ramstyle = "M10K" *) reg [63:0] lbuf [0:127];
@@ -113,7 +113,7 @@ reg [63:0] m_din_r;
 reg [27:0] eng_addr;
 reg [7:0]  beats;                           // feed beats remaining
 reg [WDBIT:0] wd = 0;                       // liveness window
-reg [3:0]  st_d = E_IDLE;                   // /57: previous state, for the per-transition wd reset
+reg [3:0]  st_d = E_IDLE;                   // previous state, for the per-transition wd reset
 reg        flush_end;                       // this flush is the frame's last -> E_DONE after
 
 assign m_addr = eng_addr[27:1];
@@ -133,7 +133,7 @@ always @* begin
     else if (st == E_FLSHP2)            lb_ra = 8'd1;                       // prime 2: prefetch word 1
     else lb_ra = (m_wr && !m_busy && lb_rd < wcnt - 1'b1) ? lb_rd + 8'd2 : lb_rd + 8'd1;
 end
-always @(posedge clk) lb_q <= lbuf[lb_ra];                                  // no reset — M10K
+always @(posedge clk) lb_q <= lbuf[lb_ra];                                  // no reset, infers M10K
 
 // ---- feed gating (mirrors S_Blit_Prepare_NLC's proven formula)
 wire [31:0] rem       = cur_wm - dec_writed;
@@ -144,13 +144,13 @@ wire        input_done = (dec_writed >= cur_wm) && final_chk;
 // progress = commit, feed beat, or flush beat (resets the liveness window)
 wire progress = eng_commit || (st == E_FEED && m_dready) || (st == E_FLSH && m_wr && !m_busy);
 
-// /57: liveness expiry = a full window spent IN the current state. The `st == st_d` term blanks
-// the ENTRY cycle: the per-transition reset below is nonblocking, so the first cycle of a state
-// still READS the inherited counter — E_RUN's escapes jumped to E_FLSHRQ with wd saturated and
-// E_FLSHRQ's own escape bounced straight back on that very cycle (last-assignment-wins even
-// cancelled the m_req pulse): a permanent 12.7ms E_RUN<->E_FLSHRQ ping-pong = the /56-/57 black
-// screen. With the entry blank + the entry reset, an escape can only fire after a full fresh
-// window inside its own state.
+// Liveness expiry means a full window spent in the current state. The `st == st_d` term blanks
+// the entry cycle, because the per-transition reset below is nonblocking and the first cycle of a
+// state still reads the inherited counter. Without the blank, E_RUN's escapes jumped to E_FLSHRQ
+// with wd saturated, and E_FLSHRQ's own escape bounced straight back on that very cycle,
+// last-assignment-wins even cancelling the m_req pulse. That is a permanent 12.7ms E_RUN to
+// E_FLSHRQ ping-pong, which presents as a black screen. With the entry blank and the entry reset,
+// an escape can only fire after a full fresh window inside its own state.
 wire wd_hit = wd[WDBIT] && (st == st_d);
 
 always @(posedge clk) begin
@@ -162,27 +162,27 @@ always @(posedge clk) begin
         lbuf[wcnt[6:0]] <= dec_ulong;
         wcnt            <= wcnt + 1'b1;
     end
-    // /55: the liveness window ticks in EVERY non-idle state (it used to tick only in
-    // E_RUN, so an engine stuck mid-DDR-transaction — E_FEED waiting a lost beat,
-    // E_FLSH* waiting a dead bus — held m_req forever and parked the ddr_mux2 grant
-    // at G_M1, freezing the blit FSM = the /55 permanent wedge). The progress reset
-    // comes AFTER the increment so it wins (the old E_RUN in-case increment silently
-    // overrode the reset on commit cycles — same-block last-assignment-wins).
+    // The liveness window ticks in every non-idle state. Ticking only in E_RUN left an
+    // engine stuck mid-DDR-transaction, E_FEED waiting a lost beat or E_FLSH* waiting a
+    // dead bus, holding m_req forever and parking the ddr_mux2 grant at G_M1, which froze
+    // the blit FSM: the permanent bus wedge. The progress reset comes after the increment
+    // so it wins; the old E_RUN in-case increment silently overrode the reset on commit
+    // cycles, the block being last-assignment-wins.
     if (st != E_IDLE) wd <= wd + 1'b1;
     if (progress) wd <= 0;
-    // /57: wd measures time IN the current state without progress — it must never be
-    // INHERITED across a transition. E_RUN's escapes fired with wd saturated and jumped
-    // to E_FLSHRQ, whose own (stale) wd[WDBIT] escape bounced straight back the very
-    // first cycle (last-assignment-wins even cancelled the m_req pulse): a permanent
-    // E_RUN<->E_FLSHRQ ping-pong = the /56-/57 black screen. Reset on every transition.
+    // wd measures time in the current state without progress, so it must never be
+    // inherited across a transition. E_RUN's escapes fired with wd saturated and jumped
+    // to E_FLSHRQ, whose own stale wd[WDBIT] escape bounced straight back on the very
+    // first cycle, last-assignment-wins even cancelling the m_req pulse. That is the
+    // permanent E_RUN to E_FLSHRQ ping-pong. Reset on every transition.
     st_d <= st;
     if (st != st_d) wd <= 0;
     if (wm_stb) begin cur_wm <= wm_bytes; cur_final <= wm_final; end
-    // /57: a pend for a NEWER frame proves the HPS finished writing cur_frame's zone (the
-    // receive loop is serial: all CSize bytes land before the next CMD_BLIT; zones rotate
-    // mod 4) — so if the final watermark rewrite was missed (superseded back-to-back by
-    // the next announce), promote to final and finish decoding instead of starving into
-    // an abandon. Never for a same-frame pend: that zone may still be streaming.
+    // A pend for a newer frame proves the HPS finished writing cur_frame's zone, because the
+    // receive loop is serial: all CSize bytes land before the next CMD_BLIT, and zones rotate
+    // mod 4. So if the final watermark rewrite was missed, superseded back-to-back by the next
+    // announce, promote to final and finish decoding instead of starving into an abandon.
+    // Never for a same-frame pend: that zone may still be streaming.
     if (st != E_IDLE && pend_valid && pend_frame != cur_frame) begin
         cur_wm    <= cur_size;
         cur_final <= 1'b1;
@@ -241,16 +241,16 @@ always @(posedge clk) begin
                 st <= E_FEEDRQ;
             end
             else if (wd_hit && input_done) begin
-                // liveness escape: input exhausted-and-final for ~12.7ms yet no dec_done —
-                // force-complete so the engine can never hold the pipeline. (Deterministic
-                // decode should make this unreachable; keep the guarantee anyway.)
+                // liveness escape: input exhausted and final for ~12.7ms yet no dec_done, so
+                // force-complete and the engine can never hold the pipeline. Deterministic
+                // decode should make this unreachable, but keep the guarantee anyway.
                 wd_fired  <= 1'b1;
                 flush_end <= 1'b1;
                 st        <= (wcnt != 8'd0) ? E_FLSHRQ : E_DONE;
             end
             else if (wd_hit && pend_valid) begin
                 // input starved (host stopped mid-frame) while a NEWER frame waits: abandon
-                // cleanly — flush what landed, do NOT publish, adopt the newer frame.
+                // cleanly, flushing what landed without publishing, then adopt the newer frame.
                 wd_fired    <= 1'b1;
                 end_publish <= 1'b0;
                 flush_end   <= 1'b1;
@@ -268,7 +268,7 @@ always @(posedge clk) begin
                 m_rd     <= 1'b1;
                 st       <= E_FEED;
             end
-            if (wd_hit) begin                          // /55: no grant (dead arbiter/bus) — release
+            if (wd_hit) begin                          // no grant (dead arbiter or bus), release
                 m_req    <= 1'b0;                    // and retry from E_RUN with a fresh window
                 m_rd     <= 1'b0;                    // (overrides a same-cycle m_gnt branch)
                 wd       <= 0;
@@ -290,7 +290,7 @@ always @(posedge clk) begin
                 m_req <= 1'b0;
                 st    <= E_RUN;
             end
-            if (wd_hit) begin                          // /55: beats stopped arriving — release the
+            if (wd_hit) begin                          // beats stopped arriving, release the
                 m_rd      <= 1'b0;                   // bus so G_M1 can never be held forever;
                 m_req     <= 1'b0;                   // residual beats drain ignored in E_RUN.
                 dec_wlong <= 1'b0;                   // accounting stays coherent (dec_writed only
@@ -304,7 +304,7 @@ always @(posedge clk) begin
         begin
             m_req <= 1'b1;
             if (m_gnt) st <= E_FLSHP1;
-            if (wd_hit) begin                          // /55: same no-grant escape as E_FEEDRQ; the
+            if (wd_hit) begin                          // same no-grant escape as E_FEEDRQ; the
                 m_req    <= 1'b0;                    // chunk stays accumulated, E_RUN re-enters
                 wd       <= 0;                       // the flush with a fresh window.
                 wd_fired <= 1'b1;
@@ -343,7 +343,7 @@ always @(posedge clk) begin
                     lb_rd    <= lb_rd + 1'b1;
                 end
             end
-            if (wd_hit) begin                          // /55: bus dead mid write-burst — abandon the
+            if (wd_hit) begin                          // bus dead mid write-burst, abandon the
                 m_wr     <= 1'b0;                    // chunk (bounded FB staleness in one region)
                 m_req    <= 1'b0;                    // rather than hold the grant forever. ddram's
                 wcnt     <= 8'd0;                    // 001-state self-terminates after ram_burst.
