@@ -49,3 +49,8 @@ sim/obj_dir_*/
 sim/*.ppm
 sim/aclk_sta/*.log
 sim/aclk_sta/sta_results.txt
+
+# Superseded build outputs and third-party archives. Kept on disk, not in git:
+# they are 613 MB of binaries nothing in the repo references.
+test-builds/
+old-builds/
