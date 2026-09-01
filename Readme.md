@@ -54,8 +54,7 @@ Thanks to PCSX2 team.
 ### [RPCS3](https://github.com/verbst/rpcs3)
 - Dualshock input support w/Rumble (Use Analog Setting)
   
-### [Retroarch]
-In progress
+### [Retroarch](https://github.com/verbst/RetroArch)
 
 ### [Flycast (Non-Dojo)]
 In progress
