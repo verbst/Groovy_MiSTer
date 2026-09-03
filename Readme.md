@@ -44,10 +44,13 @@ https://youtu.be/H0175WJFpUs
 ## Installation
 - Copy the release version of MiSTer_groovy to /media/fat 
 - Copy the release version of Groovy.rbf to /media/fat/_Utility 
-- Edit MiSTer.ini and add custom binary at end of file<br />
+- Edit MiSTer.ini and add custom binary at end of file. Original Groovy MiSTer & Groovy MiSTer NLC can exist side by side:<br />
   <sub>
   [Groovy]<br />
-  main=MiSTer_groovy<br />
+main=MiSTer_groovy<br />
+<br />
+[GroovyNLC]<br />
+main=MiSTer_groovyNLC<br />
   </sub>
   
 ## Emulators available
