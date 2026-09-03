@@ -1,4 +1,7 @@
 # NLC Groovy core for MiSTer
+<img width="64" height="64" alt="logo_64_alpha" src="https://github.com/user-attachments/assets/6e9e3c9b-c168-43fd-871a-d2211153b7be" />
+
+
 
 This version adds new NLC compression, input support and stability improvements (particularly for 480i/480p).
 The emulators below are validated with this version. Older emulators w/groovy are untested, and maybe have input issues. It is recommended to use the updated NLC versions.
