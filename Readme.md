@@ -2,7 +2,6 @@
 <img width="64" height="64" alt="logo_64_alpha" src="https://github.com/user-attachments/assets/6e9e3c9b-c168-43fd-871a-d2211153b7be" />
 
 
-
 This version adds new NLC compression, input support and stability improvements (particularly for 480i/480p).
 The emulators below are validated with this version. Older emulators w/groovy are untested, and maybe have input issues. It is recommended to use the updated NLC versions.
 See releases for more details
@@ -24,6 +23,8 @@ nlc rice  ycc  n2          2.95       2.89        168.7        171.9       5.78 
 - Connection stability fixes, reconnect and auto connection closing
 - Extended controller support (Full Dualshock w/Rumble)
 - Controller menu updates. Reassign a single button or swap profiles quickly within the new Controller MiSTer UI. Handy when swapping between different emulators.
+
+For the latest updates, or more information, please reach out on the MiSTer Discord Channel
 
 
 ## General description
@@ -99,4 +100,3 @@ MiSTer Discord #dev-talk
 @Emulators teams: Mednafen, MAME and Retroarch
 
 @alexxnr for testing it and encourage me in the project
-
