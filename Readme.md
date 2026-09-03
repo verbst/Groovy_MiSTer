@@ -43,15 +43,16 @@ https://youtu.be/H0175WJFpUs
 - [History](https://github.com/psakhis/Groovy_MiSTer/blob/main/history.txt)
 
 ## Installation
-- Copy the release version of MiSTer_groovy to /media/fat 
-- Copy the release version of Groovy.rbf to /media/fat/_Utility 
+- Copy the release version of MiSTer_groovyNLC to /media/fat 
+- Copy the release version of GroovyNLC.rbf to /media/fat/_Utility 
 - Edit MiSTer.ini and add custom binary at end of file. Original Groovy MiSTer & Groovy MiSTer NLC can exist side by side:<br />
   <sub>
   [Groovy]<br />
-main=MiSTer_groovy<br />
-<br />
-[GroovyNLC]<br />
-main=MiSTer_groovyNLC<br />
+  main=MiSTer_groovy<br />
+  </sub><br />
+  <sub>
+  [GroovyNLC]<br />
+  main=MiSTer_groovyNLC<br />
   </sub>
   
 ## Emulators available
